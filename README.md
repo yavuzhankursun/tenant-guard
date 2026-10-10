@@ -1,34 +1,35 @@
 # tenant-guard
 
-*[English version](README.en.md)*
+*[Türkçe sürüm](README.tr.md)*
+[![CI](https://github.com/yavuzhankursun/tenant-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/yavuzhankursun/tenant-guard/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 
-tenant-guard, bir Spring/JDBC uygulamasının testleri sırasında kiracılar (tenant) arası veri
-sızıntısını PostgreSQL'in **içinden** izleyerek bulur. Bir row-level-security "gözlemci"
-politikası, executor'ın okuduğu her satırı raporlar; bir JDBC proxy'si de bu satırları testin o an
-adına davrandığı kiracıyla karşılaştırır. Böylece Hibernate'in `@TenantId` filtresinin ve HTTP
-seviyesindeki tarayıcıların göremediği sızıntıları yakalar: native query'ler, `JdbcTemplate`,
-raporlar ve yabancı satırı hiçbir zaman "satır olarak" döndürmeyen aggregate'ler (`SUM`, `MAX`,
-`count(*)`).
+tenant-guard finds cross-tenant data leaks in a Spring/JDBC application's tests by watching from
+inside PostgreSQL. A row-level-security "observer" policy reports every row the executor reads, and
+a JDBC proxy matches those rows against the tenant the test is acting as. So it catches the leaks
+that Hibernate's `@TenantId` filter and HTTP-level scanners can't see: native queries,
+`JdbcTemplate`, reports and aggregates (`SUM`, `MAX`, `count(*)`) that never return a foreign row
+as such.
 
-Durum: prototip. Yalnızca PostgreSQL. Java 21, Spring Boot 3.5, JUnit 5.
+Status: prototype. PostgreSQL only. Java 21, Spring Boot 3.5, JUnit 5.
 
-## Neden veritabanının içinden
+Design decisions, in the order they were made, with what each one replaced: [docs/design-notes.md](docs/design-notes.md).
 
-Dışarıdan bakan bir tarayıcı yalnızca HTTP'yi görür. Diyelim ki kiracı B `GET /reports/total`
-çağırdı ve `{"total": 1300}` aldı. Sorgu, kiracı filtresi unutulmuş bir
-`SELECT sum(amount) FROM invoice` ise 1300 zaten A'nın faturalarını da içeriyordur. Ama yanıtta
-A'ya ait tek bir alan, id ya da metin yoktur; A'nın verisiyle eşleştirilecek bir şey yoktur.
-Tarayıcının yapabileceği tek şey A'nın verisi varken ve yokken yanıtları karşılaştırmaktır. Bu
-karşılaştırma da değeri değişmeyen aggregate'leri kaçırır (A'nın değerleri B'nin aralığındayken
-`MAX`, `EXISTS`, `count(*) > 0`).
+## Why inside the database
 
-Veritabanının içinde soru basitleşir: *bu statement hangi kiracıların satırlarını okudu?*
-Politika, SQL'i kim üretmiş olursa olsun, executor'ın okuduğu her satır için bir kez çalışır.
+An outside-in scanner sees only HTTP. Say tenant B calls `GET /reports/total` and gets
+`{"total": 1300}`. If the query is `SELECT sum(amount) FROM invoice` with the tenant filter
+missing, 1300 already includes tenant A's invoices. But the response holds no field, id or
+string that belongs to A, so nothing in it can be matched against A's data. The scanner can only
+diff responses before and after A's data exists, and that diff misses aggregates whose value
+doesn't move (`MAX` when A's values sit inside B's range, `EXISTS`, `count(*) > 0`).
 
-## Nasıl çalışır
+Inside the database the question becomes simple: *which tenants' rows did this statement read?*
+The policy runs once for every row the executor reads, whatever produced the SQL.
 
-`ObserverInstaller` bir `tg_app` rolü (`NOLOGIN NOSUPERUSER NOBYPASSRLS`) ve gözlenen her
-tabloda yalnızca bu role uygulanan permissive bir politika oluşturur:
+## How it works
+
+`ObserverInstaller` creates a role `tg_app` (`NOLOGIN NOSUPERUSER NOBYPASSRLS`) and, on each
+observed table, a permissive policy for that role only:
 
 ```sql
 CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
@@ -36,74 +37,75 @@ CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
 -- tg_observe(): RAISE NOTICE 'tg|%|%', tbl, row_tenant; RETURN true;
 ```
 
-Politika hiçbir şeyi filtrelemez, yalnızca raporlar. `FORCE ROW LEVEL SECURITY` ayarlanmaz; bu
-yüzden tablo sahibi (Flyway, seeder'lar) hiçbir zaman gözlenmez. `GuardedDataSource`
-uygulamanın `DataSource`'unu sarmalar. Guard aktifken havuzdan alınan her bağlantıda
-`SET ROLE tg_app; SET client_min_messages = notice` çalışır; pasifken `RESET ROLE`.
+The policy never filters anything. It only reports. `FORCE ROW LEVEL SECURITY` is not set, so
+the table owner (Flyway, seeders) is never observed. `GuardedDataSource` wraps the app's
+`DataSource`. While the guard is active, every borrowed connection runs
+`SET ROLE tg_app; SET client_min_messages = notice`. While it is inactive, it runs `RESET ROLE`.
 
-Kiracı B filtresiz bir sorgu çalıştırdığında tek bir NOTICE'in izlediği yol:
+The path of one NOTICE, for tenant B running an unfiltered query:
 
 ```
- Uygulama / ORM    Statement proxy'si     pgjdbc             Postgres (rol: tg_app)     TenantGuard
+ App / ORM        Statement proxy        pgjdbc             Postgres (role tg_app)     TenantGuard
     |                   |                   |                        |                      |
     | executeQuery(sql) |                   |                        |                      |
-    |------------------>| toplama #1 (pgjdbc warning zincirini silmek üzere)                |
-    |                   |------------------>|------- sorgu --------->|                      |
-    |                   |                   |                        | A-1 satırı okundu    |
-    |                   |                   |                        | politika: tg_observe()|
+    |------------------>| harvest #1 (pgjdbc is about to clear the warning chain)           |
+    |                   |------------------>|------- query --------->|                      |
+    |                   |                   |                        | read row A-1         |
+    |                   |                   |                        | policy: tg_observe() |
     |                   |                   |<-- NOTICE tg|invoice|A |                      |
-    |                   |                   |   (SQLWarning zinciri) |                      |
+    |                   |                   |   (SQLWarning chain)   |                      |
     |                   |<-- ResultSet -----|                        |                      |
-    |                   | toplama #2 (execute sonrası) ----------------------------------->| RowRead(invoice, A)
-    |<-- ResultSet proxy|                   |                        |                      | Observation(sql, aktör=B)
-    | rs.next() ...     |  (ResultSet proxy'si: fetch/gezinme, clearWarnings ve close'da toplar) | -> Finding ACTOR_MISMATCH
-    | stmt.close()      |  toplama #3 (clearWarnings/close öncesi)                         |
+    |                   | harvest #2 (after execute) ------------------------------------->| RowRead(invoice, A)
+    |<-- ResultSet proxy|                   |                        |                      | Observation(sql, actor=B)
+    | rs.next() ...     |  (ResultSet proxy: harvest on fetch/navigation, clearWarnings, close)  | -> Finding ACTOR_MISMATCH
+    | stmt.close()      |  harvest #3 (before clearWarnings/close)                         |
 ```
 
-Yol üzerine notlar:
+Notes on the path:
 
-- NOTICE, `ROLLBACK` ve `READ ONLY` transaction'larda hayatta kalan tek kanaldır. Politikadan
-  bir log tablosuna yazılsaydı rollback'te silinir, `READ ONLY` ise yazmayı baştan reddederdi.
-- Warning zinciri bir imleçle okunur ve asla temizlenmez; uygulama kendi warning'lerini görmeye
-  devam eder. Warning'leri loglayıp temizleyen bir ORM bizimkileri yutamaz: `clearWarnings` ve
-  `close` çağrılmadan önce toplarız.
-- Gözlemci executor'ın *okuduğu* satırları görür, veritabanından *çıkan* satırları değil.
-  Postgres, leakproof koşulları (`text`/`bigint` üzerinde `=`) politikadan önce çalıştırır. Bu
-  koşulların elediği satırlar hiç gözlenmez. `WHERE tenant_id = 'B'` bu yüzden sessiz kalır ve
-  `findById(A'nın id'si)` tam olarak bir satırın, A'nınkinin, okunması olarak raporlanır.
+- NOTICEs are the only channel that survives `ROLLBACK` and `READ ONLY` transactions. A log
+  table written from the policy would be rolled back, and `READ ONLY` rejects the write outright.
+- The warning chain is read with a cursor and never cleared, so the application still sees its
+  own warnings. An ORM that logs and clears warnings can't swallow ours: we harvest before
+  `clearWarnings` and before `close`.
+- The observer sees rows the executor *read*, not rows that left the database. Postgres runs
+  leakproof predicates (`=` on `text`/`bigint`) before the policy. Rows those predicates reject
+  are never observed. That's why `WHERE tenant_id = 'B'` stays silent and `findById(A's id)` is
+  reported as a read of exactly one row, A's.
 
-## Modlar
+## Modes
 
-| Mod | Ne ister | Ne yakalar | Ne kaçırır |
+| Mode | What it needs | What it catches | What it misses |
 |---|---|---|---|
-| **Aktif** | test aktörü söyler: `guard.runAs("B", ...)` | B adına okunan başka bir kiracıya ait her satır; tek satırlık `findById` IDOR'u dahil (`ACTOR_MISMATCH`) | leakproof koşulların politikadan önce elediği satırlar |
-| **Pasif** | hiçbir şey (aktör bilinmez) | tek statement'ta birden fazla kiracının satırı okundu (`MULTI_TENANT_STATEMENT`) | `findById` IDOR'u (tek satır, tek kiracı). JOIN'lerde ve meşru çok kiracılı sorgularda (login, admin, zamanlanmış işler) gürültülü |
-| **Diferansiyel** | yalnızca B'nin verisiyle baseline, sonra A seed edilir, tekrar çağrılır ve fark alınır (`DifferentialProbe`) | **LEAK** = A'nın verisi var diye B'nin yanıtı değişti (kesin). **SUSPECT** = yanıt değişmedi ama gözlemci A'nın satırlarını gördü | uç değerli seed ister (aşağıda). Boolean'larda (`EXISTS`, `count(*) > 0`) ve cache'lenmiş yanıtlarda kör |
+| **Active** | the test names the actor: `guard.runAs("B", ...)` | any row of another tenant read on B's behalf, including a single-row `findById` IDOR (`ACTOR_MISMATCH`) | rows rejected by leakproof predicates before the policy |
+| **Passive** | nothing (actor unknown) | one statement read rows of more than one tenant (`MULTI_TENANT_STATEMENT`) | `findById` IDOR (one row, one tenant). Noisy on JOINs and on legitimately cross-tenant queries (login, admin, schedulers) |
+| **Differential** | baseline with B's data only, then seed A, call again, diff (`DifferentialProbe`) | **LEAK** = B's response changed because A's data exists (confirmed). **SUSPECT** = response unchanged but the observer saw A's rows | needs extreme seeding (below). Blind to booleans (`EXISTS`, `count(*) > 0`) and to cached responses |
 
-Her gözlemci bulgusu tek başına SUSPECT seviyesindedir. Doğru filtrelenmiş bir JOIN bile alt
-tablonun yabancı satırlarını, join onları elemeden önce okur. Diferansiyel mod, yanıt gerçekten
-değiştiğinde SUSPECT'i kesin bir LEAK'e çevirir.
+Every observer finding is SUSPECT-level by itself. A correctly filtered JOIN still reads the
+child table's foreign rows before the join discards them. The differential mode turns a SUSPECT
+into a confirmed LEAK when the response actually changes.
 
-**Uç değerli seed.** A'nın tutarları B'nin aralığı içindeyse filtresiz bir `MAX` A'lı ve A'sız
-aynı değeri döndürür ve fark hiçbir şey görmez. A da B gibi (100/200) seed edildiğinde `MAX`
-yalnızca SUSPECT çıktı. `Extremes`, kurbana sıralanabilir her tipin iki ucundan değer verir:
-tutar `0.01` / `999999999.99` (`numeric(12,2)`'ye sığar), zaman ve tarih `1970-01-02` /
-`2999-12-31`, C, ICU ve glibc collation'larında ilk ve son sıraya düşen metinler. A'yı ikisiyle de
-seed edin. O zaman `MAX`, `MIN` ve `ORDER BY ... LIMIT 1` A sızar sızmaz değişir.
+**Extreme seeding.** If A's amounts lie inside B's range, an unfiltered `MAX` returns the same
+value with or without A, and the diff sees nothing. With A seeded like B (100/200), `MAX` came
+out SUSPECT only. `Extremes` gives the victim values at both
+ends of every sortable type: amounts `0.01` / `999999999.99` (fit `numeric(12,2)`), instants and
+dates `1970-01-02` / `2999-12-31`, and strings that sort first/last under C, ICU and glibc
+collations. Seed A with both. Then `MAX`, `MIN` and `ORDER BY ... LIMIT 1` change as soon as A
+leaks.
 
-## Hızlı başlangıç
+## Quick start
 
 ```java
 @SpringBootTest
-@TenantIsolationTest(tenantColumn = "tenant_id")   // tablolar: şemada bu kolona sahip her tablo
+@TenantIsolationTest(tenantColumn = "tenant_id")   // tables: every table in the current schema with that column
 class TenantIsolationIT {
 
     @TestConfiguration
     static class Seed {
         @Bean
-        TenantSeeder seeder(JdbcTemplate jdbc) {          // guard pasifken, tablo sahibi olarak çağrılır
+        TenantSeeder seeder(JdbcTemplate jdbc) {          // called with the guard inactive, as the table owner
             return tenant -> {
-                if (tenant.equals("A")) {                    // önce kurban seed edilir: temiz başla
+                if (tenant.equals("A")) {                    // victim is seeded first: start clean
                     jdbc.execute("TRUNCATE invoice_line, invoice RESTART IDENTITY");
                 }
                 List<BigDecimal> amounts = tenant.equals("A")
@@ -120,112 +122,109 @@ class TenantIsolationIT {
     @Autowired InvoiceRepository invoices;
 
     @Test
-    void kiracilarBirbiriniGoremez(TenantGuard guard, ObserverSetup setup) {
-        // Uygulamanın kendi tenant bağlamını da burada B'ye ayarlayın; runAs yalnızca okumaları etiketler.
+    void tenantsCannotSeeEachOther(TenantGuard guard, ObserverSetup setup) {
+        // Also set your app's own tenant context to B here; runAs only labels the reads.
         guard.runAs("B", invoices::findAll);
 
-        assertThat(setup.skippedTables()).isEmpty();          // atlanan tablo = gözlenmeyen tablo
+        assertThat(setup.skippedTables()).isEmpty();          // a skipped table is an unobserved table
         assertThat(guard.findings(Finding.Rule.ACTOR_MISMATCH)).isEmpty();
     }
 }
 ```
 
-Her testten önce eklenti guard'ı pasifleştirip sıfırlar, varsa `TenantSeeder` bean'ini önce
-`victim` ("A") sonra `attacker` ("B") için çağırır, gözlemciyi kurar, guard'ı aktifleştirir,
-self-check'i çalıştırır ve sıfırlar. Her testten sonra guard'ı pasifleştirir. Test metotları
-`TenantGuard`, `ObserverSetup` ve `TenantSeeder` parametresi alabilir. Anotasyon,
-`TenantGuardConfiguration`'ı (guard bean'i + `DataSource` sarmalayıcısı) meta-`@Import` ile
-getirir; Spring Boot'un test desteği bunu tanır.
+Before each test the extension deactivates and resets the guard, calls the `TenantSeeder` bean
+(if any) for `victim` ("A") and then `attacker` ("B"), installs the observer, activates the
+guard, runs the self-check and resets it. After each test it deactivates the guard. Test methods
+can take `TenantGuard`, `ObserverSetup` and `TenantSeeder` parameters. The annotation imports
+`TenantGuardConfiguration` (guard bean + `DataSource` wrapper) through a meta-`@Import`, which
+Spring Boot's test support honours.
 
-- Otomatik keşif, zaten RLS politikası olan tabloları ve tırnaklı/büyük-küçük harf karışık
-  isimleri atlar. Uyarı loglar ve `ObserverSetup.skippedTables()` içinde gerekçesiyle listeler.
-  Açıkça verilen `tables = {...}` ise hata verir. Gözlenecek hiç tablo yoksa test düşer.
-- Seed'i `@BeforeEach` içinde mi yapmak istiyorsunuz? Eklenti callback'leri `@BeforeEach`
-  metotlarından *önce* çalışır; orada guard zaten kuruludur. `guard.deactivate()` deyin, seed
-  edin, sonra `guard.activate(); guard.reset()`.
-- `@SpringBootTest(classes = ...)` kullanıldığında Spring Boot iç içe `@TestConfiguration`
-  sınıflarını yok sayar. Seeder konfigürasyonunu `classes` listesine de ekleyin.
+- Auto-discovery skips tables that already have an RLS policy, and quoted/mixed-case names. It
+  logs a warning and lists them with a reason in `ObserverSetup.skippedTables()`. Explicit
+  `tables = {...}` fail instead. Finding no observable table at all fails the test.
+- Prefer seeding in `@BeforeEach`? Extension callbacks run *before* `@BeforeEach` methods, so the
+  guard is already armed there. Call `guard.deactivate()`, seed, then `guard.activate();
+  guard.reset()`.
+- With `@SpringBootTest(classes = ...)`, Spring Boot ignores nested `@TestConfiguration` classes.
+  List the seeder configuration in `classes` too.
 
 ## Self-check
 
-Bu aracın en kötü hata modu sessizce eksik raporlamadır: RLS uygulanmıyorsa sızdıran bir uygulama
-da temiz bir uygulama gibi sıfır bulgu üretir. Bu yüzden her testten önce `SelfCheck` şu
-durumlarda yüksek sesle FAIL verir:
+The worst failure mode for this tool is silent under-reporting: if RLS doesn't apply, a leaky app
+produces zero findings, exactly like a clean one. So before each test `SelfCheck` fails loudly if:
 
-- etkin rol superuser ya da `BYPASSRLS` sahibi. Testcontainers'ın varsayılan kullanıcısı
-  superuser'dır; RLS'in uygulanmasını sağlayan şey `SET ROLE tg_app`'tir;
-- tek satırlık `tg_probe` tablosuna atılan bir `SELECT` gözlemci NOTICE'i üretmiyor (politika
-  yok, `client_min_messages` NOTICE'i filtreliyor, proxy yolda değil).
+- the effective role is a superuser or has `BYPASSRLS`. Testcontainers' default user is a
+  superuser, and `SET ROLE tg_app` is what makes RLS apply at all;
+- a `SELECT` on the one-row `tg_probe` table produces no observer NOTICE (policy missing, NOTICE
+  filtered by `client_min_messages`, proxy not in the path).
 
-## Doğrulanmış davranış
+## Verified behaviour
 
-Her satır `src/test` altında bir testtir (`ObserverScenariosTest`, `DifferentialScenarioTest`,
-`JdbcPathMatrixTest`, `TenantIsolationTestAnnotationTest`), Postgres 16'ya karşı çalışır.
+Each row is a test in `src/test` (`ObserverScenariosTest`, `DifferentialScenarioTest`,
+`JdbcPathMatrixTest`, `TenantIsolationTestAnnotationTest`) against Postgres 16.
 
-| Senaryo | Sonuç |
+| Scenario | Result |
 |---|---|
-| `WHERE tenant_id = 'B'`, seq scan | bulgu yok |
-| B olarak filtresiz `SELECT sum(amount)` | `ACTOR_MISMATCH` (A) + `MULTI_TENANT_STATEMENT` |
-| `JOIN invoice ... WHERE i.tenant_id = 'B'` ile filtrelenen alt tablo | `invoice_line` için `ACTOR_MISMATCH`: **yanlış alarm**, satırlar okundu ama join eledi |
-| `@Transactional(readOnly = true)` / rollback olan transaction | notice'ler korundu, bulgu üretildi |
-| superuser bağlantı | self-check FAIL (`superuser=true`) |
-| zaten RLS politikası olan tablo | açık kurulum reddedilir; otomatik keşif gerekçesiyle atlar |
-| B olarak Hibernate `findAll()` | `ACTOR_MISMATCH` (A) |
-| B olarak `findById(A'nın id'si)` (aktif) | yakalandı |
-| aktörsüz `findById(A'nın id'si)` (pasif) | satır gözlendi, **bulgu yok** |
-| 33 JDBC erişim yolu: Statement, PreparedStatement (tek/tekrar), batch, CallableStatement, cursor (`fetchSize=1`), scrollable, JdbcTemplate, Hibernate (JPQL, native, stream, `find`), `unwrap(JDBC arayüzü)` | hepsi gözlendi |
-| diferansiyel: SUM raporu, `findAll` listesi | LEAK |
-| diferansiyel: filtreli liste | CLEAN |
-| diferansiyel: JOIN ile filtrelenen alt tablo | SUSPECT |
-| diferansiyel: `Extremes` seed'iyle `MAX`, `MIN`, `ORDER BY amount DESC LIMIT 1` | LEAK |
-| diferansiyel: `EXISTS(... WHERE lower(number) = 'b-3')` | SUSPECT: fark kör, tek sinyal gözlemci |
-| diferansiyel: B'nin satırları varken çıplak `EXISTS(SELECT 1 FROM invoice)` | CLEAN: tarama B'nin ilk satırında durur, A'nın satırları hiç okunmaz |
+| `WHERE tenant_id = 'B'`, seq scan | no finding |
+| unfiltered `SELECT sum(amount)` as B | `ACTOR_MISMATCH` (A) + `MULTI_TENANT_STATEMENT` |
+| child table filtered through `JOIN invoice ... WHERE i.tenant_id = 'B'` | `ACTOR_MISMATCH` on `invoice_line`: **false positive**, rows read but discarded by the join |
+| `@Transactional(readOnly = true)` / transaction rolled back | notices kept, finding raised |
+| superuser connection | self-check fails (`superuser=true`) |
+| table with an existing RLS policy | explicit install refused; auto-discovery skips it with the reason |
+| Hibernate `findAll()` as B | `ACTOR_MISMATCH` (A) |
+| `findById(A's id)` as B (active) | caught |
+| `findById(A's id)`, no actor (passive) | row observed, **no finding** |
+| 33 JDBC access paths: Statement, PreparedStatement (single/reused), batch, CallableStatement, cursor (`fetchSize=1`), scrollable, JdbcTemplate, Hibernate (JPQL, native, stream, `find`), `unwrap(JDBC interface)` | all observed |
+| differential: SUM report, `findAll` list | LEAK |
+| differential: filtered list | CLEAN |
+| differential: JOIN-filtered child table | SUSPECT |
+| differential: `MAX`, `MIN`, `ORDER BY amount DESC LIMIT 1` with `Extremes` seed | LEAK |
+| differential: `EXISTS(... WHERE lower(number) = 'b-3')` | SUSPECT: diff blind, observer is the only signal |
+| differential: bare `EXISTS(SELECT 1 FROM invoice)` while B has rows | CLEAN: the scan stops at B's first row, A's rows are never read |
 
-Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
+Five silent under-reporting bugs were found by these tests and fixed:
 
-1. pgjdbc, her `execute` başında statement'ın warning zincirini `clearWarnings()`'e uğramadan
-   siler. Tekrar kullanılan bir `PreparedStatement` önceki çalıştırmanın notice'lerini
-   kaybediyordu. Düzeltme: her execute'tan önce topla.
-2. `fetchSize` ayarlı ve autocommit kapalıyken sonraki cursor fetch'lerinin notice'leri
-   `Statement`'a değil `ResultSet`'e düşer. İlk partiden sonraki her satır görünmüyordu.
-   Düzeltme: `ResultSet`'i de proxy'le; gezinme, `clearWarnings` ve `close`'da topla.
-3. `unwrap(Connection.class)` ham sürücü bağlantısını döndürüyordu; oradan açılan statement'ları
-   kimse gözlemiyordu. Düzeltme: istenen tip bir JDBC arayüzüyse proxy'yi döndür.
-4. Sürücü zinciri bizim görmediğimiz bir yerde temizleyince okuma imleci bayatlıyor, yeni
-   notice'ler atlanıyordu. Düzeltme: zincirin baş nesnesi değişince sıfırdan say.
-5. Hikari `executeQuery` ve `getResultSet` için ayrı wrapper üretince aynı sürücü `ResultSet`'i
-   iki kez sarılıyor ve fetch notice'leri çift sayılıyordu. Düzeltme: sürücü `ResultSet`'i
-   başına tek proxy.
+1. pgjdbc clears a statement's warning chain at the start of every `execute`, without going
+   through `clearWarnings()`. A reused `PreparedStatement` lost the previous execution's notices.
+   Fix: harvest before each execute.
+2. With `fetchSize` set and autocommit off, notices from later cursor fetches land on the
+   `ResultSet`, not the `Statement`. Every row after the first batch went unseen. Fix: proxy the
+   `ResultSet` and harvest on navigation, `clearWarnings` and `close`.
+3. `unwrap(Connection.class)` returned the raw driver connection, whose statements nobody
+   observed. Fix: return the proxy when the requested type is a JDBC interface.
+4. The chain cursor went stale when the driver cleared the chain where we could not see it, so
+   new notices were skipped. Fix: a new chain head restarts the count.
+5. Hikari hands out separate wrappers for `executeQuery` and `getResultSet`, so one driver
+   `ResultSet` was wrapped twice and fetch notices counted twice. Fix: one proxy per driver
+   `ResultSet`.
 
-## Varsayımlar ve sınırlar
+## Assumptions and limitations
 
-- **Yalnızca PostgreSQL.** Mekanizma RLS + `RAISE NOTICE` + pgjdbc'nin `SQLWarning` zinciri.
-- **Şemanın sahibi uygulama kullanıcısı.** Gözlemci, guard pasifken sarmalanmış `DataSource`
-  üzerinden, yani uygulamanın kendi kimlik bilgileriyle kurulur. Bu kullanıcı tabloların sahibi
-  olmalıdır (Flyway ya da uygulama kullanıcısıyla çalışan migration'lar); sahibi olmayan bir rolle
-  Hibernate `ddl-auto` desteklenmez. GRANT'ler `public` şemasını hedefler.
-- **Paralel test çalıştırma yok.** Aktör ve bulgular thread-local değil, süreç genelidir. Bu
-  bilinçli bir karar: kiracı etiketi `@Async` ve thread pool'larda da hayatta kalır.
-- **Zaten RLS politikası olan tablolar desteklenmez.** Postgres permissive politikaları OR'lar;
-  uygulamanın kendi politikasının yanına her zaman true dönen bir gözlemci eklemek izolasyonu
-  kapatırdı. RESTRICTIVE gözlemci yol haritasında.
-- **Leakproof koşullar ve erken çıkışlar.** Politikadan önce text/bigint `=` ile elenen ya da hiç
-  ulaşılmayan (`EXISTS`, `LIMIT`) satırlar gözlenmez.
-- **`tg|` NOTICE öneki taklit edilebilir:** uygulamanın kendi `RAISE NOTICE`'i aynı öneki
-  kullanırsa yanlış bulgu üretir.
-- **Okunan satır başına bir NOTICE.** Büyük seed'ler ve tam taramalar yavaştır. Bir avuç satır
-  seed edin.
-- **`GRANT ... ON ALL TABLES` yalnızca mevcut tabloları kapsar.** Kurulumdan sonra oluşturulan
-  tablolar `tg_app`'e verilmez.
-- **Sürücüye özgü `unwrap`** (ör. `PGConnection`) ham bağlantıyı döndürür; oradan açılan
-  statement'lar proxy'yi atlar.
-- Yazma tarafı (`WITH CHECK`) gözlenmez.
+- **PostgreSQL only.** The mechanism is RLS + `RAISE NOTICE` + pgjdbc's `SQLWarning` chain.
+- **Schema owned by the app user.** The observer is installed through the guarded `DataSource`
+  while inactive, i.e. with the app's own credentials. These must own the tables (Flyway, or
+  migrations run as the app user), not Hibernate `ddl-auto` under a non-owner role. Grants target
+  schema `public`.
+- **No parallel test execution.** The actor and the findings are process-wide, not thread-local.
+  That's on purpose: the tenant label survives `@Async` and thread pools.
+- **Tables with existing RLS policies are unsupported.** Postgres ORs permissive policies, so an
+  always-true observer next to the app's own policy would switch its isolation off. A RESTRICTIVE
+  observer is on the roadmap.
+- **Leakproof predicates and early exits.** Rows rejected by `=` on text/bigint before the
+  policy, or never reached (`EXISTS`, `LIMIT`), are not observed.
+- **The `tg|` NOTICE prefix is spoofable** by the application's own `RAISE NOTICE`.
+- **One NOTICE per row read.** Large seeds and full scans are slow. Seed a handful of rows.
+- **`GRANT ... ON ALL TABLES` covers existing tables only.** Tables created after installation
+  are not granted to `tg_app`.
+- **Driver-specific `unwrap`** (e.g. to `PGConnection`) returns the raw connection, and
+  statements created from it bypass the proxy.
+- The write side (`WITH CHECK`) is not observed.
 
-## Endpoint taraması
+## Endpoint scanning
 
-HTTP katmanı, uygulamanın her `GET` endpoint'ini saldırgan (B) olarak kurbanın (A) verisine
-karşı çağırır; altta gözlemci ve diferansiyel sonda çalışır. Endpoint'ler Spring'in
-`RequestMappingHandlerMapping` bean'inden keşfedilir: OpenAPI dosyası ve token listesi gerekmez.
+The HTTP layer drives every `GET` endpoint of the app as the attacker (B) against the victim's
+(A) data, with the observer and the differential probe underneath. Endpoints are discovered from
+Spring's `RequestMappingHandlerMapping`: no OpenAPI file, no token list.
 
 ```java
 @SpringBootTest
@@ -234,11 +233,11 @@ karşı çağırır; altta gözlemci ve diferansiyel sonda çalışır. Endpoint
 class EndpointIsolationIT {
 
     @Test
-    void kiracilarBirbiriniGoremez(TenantGuard guard, @Autowired MockMvc mockMvc,
+    void tenantsCannotSeeEachOther(TenantGuard guard, @Autowired MockMvc mockMvc,
                                    @Autowired ApplicationContext context, @Autowired DataSource dataSource) {
         EndpointScanner.builder(mockMvc, guard)
                 .endpoints(EndpointDiscovery.discover(context))
-                .seeder(tenant -> /* o kiracının satırlarını sahibi olarak ekle */)
+                .seeder(tenant -> /* insert that tenant's rows, as the owner */)
                 .authenticator(tenant -> request -> { request.addHeader("X-Tenant", tenant); return request; })
                 .resourceIds(ResourceIds.builder()
                         .id("/invoices/{invoiceId}/lines/{lineId}", "lineId", tenant -> /* override */)
@@ -251,19 +250,19 @@ class EndpointIsolationIT {
 }
 ```
 
-Tarama aşamalarla ilerler: B'yi seed et → path değişkeni olmayan her endpoint'i B olarak çağırıp
-baseline kaydet (her istekte değişen alanları ayıklamak için iki kez) → A'yı seed et → her
-endpoint'i B olarak çağır, `{id}` tipi değişkenlere A'nın id'lerini koy. Kararlar:
+The scan runs in phases: seed B → record a baseline of every endpoint without path variables as B
+(twice, to mask fields that change on every call) → seed A → call every endpoint as B, with A's
+ids substituted into `{id}`-style variables. Verdicts:
 
-| Karar     | Anlamı                                                                                        |
-|-----------|-----------------------------------------------------------------------------------------------|
-| `LEAK`    | A'nın id'siyle çağrılan endpoint 2xx döndü, ya da A'nın verisi eklenince yanıt değişti         |
-| `SUSPECT` | Yanıt değişmedi / 403 / 404, ama gözlemci çağrı sırasında A'nın satırlarının okunduğunu gördü |
-| `CLEAN`   | İkisi de değil                                                                                |
-| `SKIPPED` | Id çözülemedi (gerekçe notta) ya da 401: authenticator büyük ihtimalle yanlış                 |
-| `ERROR`   | 5xx ya da handler exception. `assertNoLeaks()`'i düşürür: çökmek güvenliğin kanıtı değildir  |
+| Verdict   | Meaning                                                                                   |
+|-----------|-------------------------------------------------------------------------------------------|
+| `LEAK`    | 2xx on an endpoint called with A's id, or the response changed after A's data was added    |
+| `SUSPECT` | Response unchanged / 403 / 404, but the observer saw A's rows being read during the call   |
+| `CLEAN`   | Neither                                                                                   |
+| `SKIPPED` | Id could not be resolved (reason in the note), or 401: the authenticator is probably wrong |
+| `ERROR`   | 5xx or handler exception. Fails `assertNoLeaks()`: a crash is not proof of safety          |
 
-`assertNoLeaks()` örnek uygulamada şuna benzer bir tablo basar:
+`assertNoLeaks()` prints a table like this one from the sample app:
 
 ```
 Tenant isolation scan: 3 of 5 GET endpoint(s) failed for tenant B against tenant A's data (3 LEAK)
@@ -273,27 +272,27 @@ Tenant isolation scan: 3 of 5 GET endpoint(s) failed for tenant B against tenant
   LEAK     GET /reports/total 200    response changed after tenant A's data was added: $.total; observer: ...
 ```
 
-`{id}` → tablo eşlemesi, tabloyu önceki path parçasından ve değişken adından tahmin eder
-(`/invoices/{id}` → `invoice`, `{invoiceLineId}` → `invoice_line`), her identifier'ı SQL'e
-ulaşmadan doğrular ve hiçbiri eşleşmezse denediği isimlerle birlikte `SKIPPED` raporlar. İç içe
-id'ler bağımsız çözülür; `/invoices/{a}/lines/{b}` genellikle override ister. Yalnızca `GET`
-taranır; query parametresi, pagination ve istek gövdesi üretilmez. Guard'ın aktörü global olduğu
-için çağrılar sıralıdır.
+`{id}` → table mapping guesses the table from the preceding path segment and the variable name
+(`/invoices/{id}` → `invoice`, `{invoiceLineId}` → `invoice_line`), validates every identifier
+before it reaches SQL, and reports `SKIPPED` with the names it tried when nothing matches.
+Nested ids are resolved independently, so `/invoices/{a}/lines/{b}` usually needs an override.
+Only `GET` is scanned; query parameters, pagination and request bodies are not generated.
+Calls are sequential because the guard's actor is global.
 
-## Yol haritası
+## Roadmap
 
-- Üretilmiş gövdelerle POST/PUT/DELETE taraması; DELETE en sona, sonrasında yeniden seed.
-- Zaten RLS kullanan tablolar için RESTRICTIVE gözlemci politikası.
-- Yazma tarafının gözlenmesi (başka kiracıya `INSERT`/`UPDATE`).
-- Sabit `tg|` öneki yerine oturum başına NOTICE nonce'u.
-- `ALTER DEFAULT PRIVILEGES` ve `public` dışı şemalar.
+- POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
+- RESTRICTIVE observer policy for tables that already use RLS.
+- Write-side observation (`INSERT`/`UPDATE` into another tenant).
+- Per-session NOTICE nonce instead of the fixed `tg|` prefix.
+- `ALTER DEFAULT PRIVILEGES` and non-`public` schemas.
 
-## Benzer araçlar
+## Related tools
 
-- **AuthProbe**: dışarıdan bakar.
-- **Burp Autorize**: dışarıdan bakar.
-- **Snyk API & Web**: dışarıdan bakar.
-- **Unit 42 BOLABuster**: dışarıdan bakar.
+- **AuthProbe**: outside-in.
+- **Burp Autorize**: outside-in.
+- **Snyk API & Web**: outside-in.
+- **Unit 42 BOLABuster**: outside-in.
 
-tenant-guard bunları içeriden tamamlar. Yanıtta hiç görünmeyen okumaları görür; Postgres'e
-dokunmayan hiçbir şeyi göremez.
+tenant-guard complements them from the inside. It sees reads that never show up in a response,
+and it can't see anything that doesn't touch Postgres.

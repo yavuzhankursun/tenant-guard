@@ -4,24 +4,23 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLWarning;
 import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Collects observer notices from a statement's warning chain. Harvests right after execute, and
  * again before clearWarnings/close so an ORM that logs-and-clears warnings cannot swallow them.
- * The chain itself is left untouched for the application.
+ * The chain itself is left untouched for the application. Result sets are wrapped as well, because
+ * notices from later cursor fetches land on them.
  */
 final class ObservingStatementHandler implements InvocationHandler {
 
     private final Statement target;
     private final Connection owner;
     private final TenantGuard guard;
+    private final WarningCursor cursor = new WarningCursor();
     private String sql;
-    private int consumed;
 
     ObservingStatementHandler(Statement target, Connection owner, TenantGuard guard, String sql) {
         this.target = target;
@@ -38,10 +37,13 @@ final class ObservingStatementHandler implements InvocationHandler {
             case "getConnection" -> {
                 return owner;
             }
+            case "getResultSet" -> {
+                return wrapResultSet(call(method, args), (Statement) proxy);
+            }
             case "clearWarnings" -> {
                 harvest(TenantGuard.HarvestPoint.CLEAR_WARNINGS);
                 Object result = call(method, args);
-                consumed = 0;
+                cursor.reset();
                 return result;
             }
             case "close" -> {
@@ -56,27 +58,23 @@ final class ObservingStatementHandler implements InvocationHandler {
                 }
                 // pgjdbc clears the chain itself on every execute, bypassing our clearWarnings hook.
                 harvest(TenantGuard.HarvestPoint.CLEAR_WARNINGS);
-                consumed = 0;
+                cursor.reset();
                 if (args != null && args.length > 0 && args[0] instanceof String executed) {
                     sql = executed;
                 }
                 Object result = call(method, args);
                 harvest(TenantGuard.HarvestPoint.EXECUTE);
-                return result;
+                return wrapResultSet(result, (Statement) proxy);
             }
         }
     }
 
+    private Object wrapResultSet(Object result, Statement proxy) {
+        return result instanceof ResultSet rs ? ObservingResultSetHandler.wrap(rs, proxy, guard, sql) : result;
+    }
+
     private void harvest(TenantGuard.HarvestPoint point) throws SQLException {
-        List<RowRead> rows = new ArrayList<>();
-        int index = 0;
-        for (SQLWarning w = target.getWarnings(); w != null; w = w.getNextWarning(), index++) {
-            if (index >= consumed) {
-                RowRead.parse(w).ifPresent(rows::add);
-            }
-        }
-        consumed = index;
-        guard.record(sql, rows, point);
+        guard.record(sql, cursor.drain(target.getWarnings()), point);
     }
 
     private Object call(Method method, Object[] args) throws Throwable {

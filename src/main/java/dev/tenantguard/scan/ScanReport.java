@@ -5,8 +5,10 @@ import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.springframework.web.bind.annotation.RequestMethod;
 
 /** Immutable outcome of one scan; the assert methods are meant to be the last line of a test. */
 public final class ScanReport {
@@ -29,11 +31,24 @@ public final class ScanReport {
         return results;
     }
 
-    public ScanResult result(String pathTemplate) {
-        return results.stream()
-                .filter(r -> r.pathTemplate().equals(pathTemplate))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Not scanned: " + pathTemplate));
+    /**
+     * {@code "PUT /invoices/{id}"} matches method and template. A bare template matches any method:
+     * the GET row when there is one (scans before writes existed only had GETs), otherwise the only
+     * row with that template; several writes on one template need the method.
+     */
+    public ScanResult result(String endpoint) {
+        if (endpoint.contains(" ")) {
+            return results.stream().filter(r -> r.endpoint().label().equals(endpoint)).findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Not scanned: " + endpoint));
+        }
+        List<ScanResult> matches = results.stream().filter(r -> r.pathTemplate().equals(endpoint)).toList();
+        if (matches.isEmpty()) {
+            throw new IllegalArgumentException("Not scanned: " + endpoint);
+        }
+        return matches.stream().filter(r -> r.endpoint().method() == RequestMethod.GET).findFirst()
+                .or(() -> matches.size() == 1 ? Optional.of(matches.getFirst()) : Optional.empty())
+                .orElseThrow(() -> new IllegalArgumentException("Ambiguous: %s was scanned as %s; name the method"
+                        .formatted(endpoint, matches.stream().map(r -> r.endpoint().label()).toList())));
     }
 
     public List<ScanResult> withVerdict(Verdict verdict) {
@@ -62,8 +77,10 @@ public final class ScanReport {
         if (failed.isEmpty()) {
             return;
         }
-        String header = "Tenant isolation scan: %d of %d GET endpoint(s) failed for tenant %s against tenant %s's data (%s)"
-                .formatted(failed.size(), results.size(), attacker, victim, counts(failed));
+        // Kept as "GET endpoint(s)" for read-only scans: existing CI logs and greps match on it.
+        String kind = results.stream().allMatch(r -> r.endpoint().method() == RequestMethod.GET) ? "GET endpoint(s)" : "endpoint(s)";
+        String header = "Tenant isolation scan: %d of %d %s failed for tenant %s against tenant %s's data (%s)"
+                .formatted(failed.size(), results.size(), kind, attacker, victim, counts(failed));
         String others = counts(results.stream().filter(r -> !failing.contains(r.verdict())).toList());
         throw new AssertionError(header + "\n" + table(failed)
                 + (others.isEmpty() ? "" : "\nNot failing: " + others + " (full table: ScanReport.toString())"));
@@ -84,11 +101,11 @@ public final class ScanReport {
     }
 
     private static String table(List<ScanResult> rows) {
-        int width = rows.stream().mapToInt(r -> r.pathTemplate().length()).max().orElse(0) + "GET ".length();
+        int width = rows.stream().mapToInt(r -> r.endpoint().label().length()).max().orElse("GET ".length());
         String format = "  %-8s %-" + width + "s %-6s %s";
         String head = format.formatted("VERDICT", "ENDPOINT", "STATUS", "NOTE").stripTrailing();
         return rows.stream()
-                .map(r -> format.formatted(r.verdict(), "GET " + r.pathTemplate(),
+                .map(r -> format.formatted(r.verdict(), r.endpoint().label(),
                         r.status() == 0 ? "-" : String.valueOf(r.status()), r.note()).stripTrailing())
                 .collect(Collectors.joining("\n", head + "\n", ""));
     }

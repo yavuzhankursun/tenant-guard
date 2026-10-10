@@ -16,6 +16,8 @@ Status: prototype. PostgreSQL only. Java 21, Spring Boot 3.5, JUnit 5.
 
 Design decisions, in the order they were made, with what each one replaced: [docs/design-notes.md](docs/design-notes.md).
 
+Write-up (Turkish): [Unutulan tenant filtresini veritabanının içinden yakalamak](https://medium.com/@ykurrsun/8c81babb7a4a).
+
 ## Why inside the database
 
 An outside-in scanner sees only HTTP. Say tenant B calls `GET /reports/total` and gets

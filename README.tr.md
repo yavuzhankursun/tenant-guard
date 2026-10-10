@@ -17,6 +17,8 @@ Durum: prototip. Yalnızca PostgreSQL. Java 21, Spring Boot 3.5, JUnit 5.
 
 Tasarım kararları, verildikleri sırayla ve neyin yerine geçtikleriyle (İngilizce): [docs/design-notes.md](docs/design-notes.md).
 
+Yazı: [Unutulan tenant filtresini veritabanının içinden yakalamak](https://medium.com/@ykurrsun/8c81babb7a4a) (Medium).
+
 ## Neden veritabanının içinden
 
 Dışarıdan bakan bir tarayıcı yalnızca HTTP'yi görür. Diyelim ki kiracı B `GET /reports/total`

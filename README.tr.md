@@ -385,6 +385,13 @@ değiştirir; aşağıdaki her hücre eklenmeden önce lokalde geçti:
 Desteklenen en eski Spring Boot: 3.2 (Spring Framework 6.1, Hibernate 6.4); Java 21. Boot 3.2'de
 test fixture'ı Flyway 10 ister; `-Dboot.version=3.2.12` bunu otomatik açar.
 
+Matrisin ilk CI koşuları macOS'ta hiç görünmeyen iki şey daha yakaladı, ikisi de havuz sırasına
+bağlı: bir test Hikari bağlantısını kirli `search_path` ile, bir diğeri autocommit kapalı iade
+ediyordu; Hikari ikisini de dönüşte onarır, tomcat-jdbc onarmaz ve sonraki observer kurulumu
+`ALTER TABLE ... ENABLE ROW LEVEL SECURITY`'de job'ın 30 dakikası boyunca bloke oldu. Kurulumcu artık
+DDL'ini `lock_timeout` altında çalıştırıyor ve zaman aşımında asılı kalmak yerine kilidi tutan
+oturumları (pid, durum, son sorgu) söylüyor.
+
 Matrisin bulup düzelttikleri: havuz **statement cache**'i açıkken (tomcat-jdbc, DBCP2, c3p0,
 vibur) cache'lenmiş bir `PreparedStatement` önceki kullanıcının warning zincirini sonrakine
 devrediyordu; satırlar çift sayılıyor ve A'nın kendi okuması B'ye yazılıyordu. DBCP2'nin `ResultSet`

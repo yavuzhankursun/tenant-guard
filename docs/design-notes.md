@@ -191,6 +191,12 @@ Five dimensions, one agent each, every cell run locally before it went into CI:
   and is guarded now. Routing DataSources are installed and self-checked per target; unlisted
   DataSources are switched off with a warning rather than observed-but-never-installed.
 
+The matrix's first CI runs then failed where the local runs never had: a dirty `search_path` and
+an autocommit left off on connections returned to the pool. Hikari repairs both on return,
+tomcat-jdbc does not, and an observer install blocked on a table lock for the job's whole timeout.
+The installer now uses a `lock_timeout` and reports the lock holders; a hang is the one failure
+mode worse than a wrong answer.
+
 ## 12. Things deliberately kept simple
 
 - The actor is a global, not a `ThreadLocal`: the scanner issues one request at a time, and a

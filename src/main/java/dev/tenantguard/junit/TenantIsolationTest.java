@@ -44,6 +44,15 @@ public @interface TenantIsolationTest {
      */
     String[] tables() default {};
 
+    /**
+     * Names of the {@code DataSource} beans to observe. Empty (the default): the {@code @Primary} (or
+     * only) one. The observer is installed and self-checked through each; an
+     * {@code AbstractRoutingDataSource} through each of its resolved targets. Every other DataSource
+     * bean keeps the app's own role while the guard is active and is listed in
+     * {@link ObserverSetup#warnings()} as not observed.
+     */
+    String[] dataSources() default {};
+
     /** Tenant whose rows must not leak; seeded first, so a seeder may start by truncating. */
     String victim() default "A";
 

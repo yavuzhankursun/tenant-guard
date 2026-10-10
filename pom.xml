@@ -100,4 +100,67 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <profiles>
+        <!-- Mutation testing of the JDBC core: mvn -B -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage
+             The default build is untouched. Reports land in target/pit-reports (index.html, mutations.xml). -->
+        <profile>
+            <id>mutation</id>
+            <dependencies>
+                <!-- pitest-junit5-plugin 1.2+ uses the launcher on the test classpath instead of bundling one. -->
+                <dependency>
+                    <groupId>org.junit.platform</groupId>
+                    <artifactId>junit-platform-launcher</artifactId>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-maven</artifactId>
+                        <version>1.30.0</version>
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.pitest</groupId>
+                                <artifactId>pitest-junit5-plugin</artifactId>
+                                <version>1.2.3</version>
+                            </dependency>
+                        </dependencies>
+                        <configuration>
+                            <targetClasses>
+                                <param>dev.tenantguard.*</param>
+                            </targetClasses>
+                            <excludedClasses>
+                                <param>dev.tenantguard.scan.*</param>
+                                <param>dev.tenantguard.junit.*</param>
+                                <param>dev.tenantguard.spring.*</param>
+                            </excludedClasses>
+                            <targetTests>
+                                <param>dev.tenantguard.*Test</param>
+                            </targetTests>
+                            <excludedTestClasses>
+                                <param>dev.tenantguard.scan.*</param>
+                            </excludedTestClasses>
+                            <mutators>
+                                <mutator>STRONGER</mutator>
+                            </mutators>
+                            <!-- Each minion JVM starts its own Postgres container (GuardedTestBase's static
+                                 block) and Spring context; more threads mean more containers at once. -->
+                            <threads>2</threads>
+                            <!-- The first test in a minion pays container + Spring start-up (10-20 s). A short
+                                 timeout would count that as TIMED_OUT, i.e. a falsely "killed" mutant. -->
+                            <timeoutConstant>180000</timeoutConstant>
+                            <timeoutFactor>3</timeoutFactor>
+                            <timestampedReports>false</timestampedReports>
+                            <outputFormats>
+                                <param>HTML</param>
+                                <param>XML</param>
+                            </outputFormats>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

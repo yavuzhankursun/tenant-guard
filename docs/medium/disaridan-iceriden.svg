@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="460" viewBox="0 0 1000 460" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <rect width="1000" height="460" fill="#ffffff"/>
+
+  <!-- left: outside-in -->
+  <rect x="30" y="30" width="450" height="400" rx="16" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="255" y="72" text-anchor="middle" font-size="22" font-weight="700" fill="#24292f">Dışarıdan (HTTP tarayıcısı)</text>
+  <text x="255" y="100" text-anchor="middle" font-size="15" fill="#57606a">B olarak isteği at, yanıta bak</text>
+
+  <rect x="60" y="130" width="390" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="80" y="165" font-family="Menlo, monospace" font-size="17" fill="#24292f">GET /reports/total</text>
+
+  <rect x="60" y="206" width="390" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="80" y="241" font-family="Menlo, monospace" font-size="17" fill="#24292f">200  {"total": 1300}</text>
+
+  <text x="255" y="310" text-anchor="middle" font-size="17" fill="#24292f">Yanıtta A'ya ait alan, id ya da metin yok.</text>
+  <text x="255" y="336" text-anchor="middle" font-size="17" fill="#24292f">Eşleştirilecek bir şey yok.</text>
+  <rect x="135" y="362" width="240" height="44" rx="22" fill="#dafbe1" stroke="#2da44e"/>
+  <text x="255" y="391" text-anchor="middle" font-size="18" font-weight="700" fill="#1a7f37">✓ temiz görünüyor</text>
+
+  <!-- right: inside-out -->
+  <rect x="520" y="30" width="450" height="400" rx="16" fill="#fff8f5" stroke="#ffb8a8"/>
+  <text x="745" y="72" text-anchor="middle" font-size="22" font-weight="700" fill="#24292f">İçeriden (tenant-guard)</text>
+  <text x="745" y="100" text-anchor="middle" font-size="15" fill="#57606a">Bu sorgu hangi kiracının satırını okudu?</text>
+
+  <rect x="550" y="130" width="390" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="570" y="165" font-family="Menlo, monospace" font-size="16" fill="#24292f">SELECT sum(amount) FROM invoice</text>
+
+  <rect x="550" y="206" width="390" height="92" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="570" y="238" font-family="Menlo, monospace" font-size="16" fill="#57606a">okunan satırlar:</text>
+  <text x="570" y="266" font-family="Menlo, monospace" font-size="16" fill="#24292f">invoice | B  ×2</text>
+  <text x="760" y="266" font-family="Menlo, monospace" font-size="16" font-weight="700" fill="#cf222e">invoice | A  ×2</text>
+
+  <text x="745" y="336" text-anchor="middle" font-size="17" fill="#24292f">Aktör B, ama A'nın satırları okundu.</text>
+  <rect x="610" y="362" width="270" height="44" rx="22" fill="#ffebe9" stroke="#cf222e"/>
+  <text x="745" y="391" text-anchor="middle" font-size="18" font-weight="700" fill="#cf222e">✗ ACTOR_MISMATCH</text>
+</svg>

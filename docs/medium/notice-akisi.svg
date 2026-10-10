@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="760" viewBox="0 0 1000 760" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="760" fill="#ffffff"/>
+  <text x="500" y="44" text-anchor="middle" font-size="24" font-weight="700" fill="#24292f">Bir NOTICE'in yolculuğu</text>
+
+  <!-- left column: layers -->
+  <g font-size="14" fill="#57606a" text-anchor="end">
+    <text x="190" y="112">Uygulama</text>
+    <text x="190" y="212">Postgres</text>
+    <text x="190" y="312">Postgres</text>
+    <text x="190" y="412">pgjdbc</text>
+    <text x="190" y="512">tenant-guard</text>
+    <text x="190" y="612">tenant-guard</text>
+  </g>
+
+  <!-- boxes -->
+  <g>
+    <rect x="220" y="80" width="560" height="60" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="500" y="106" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">Test B kiracısı adına bir istek atar</text>
+    <text x="500" y="128" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#57606a">guard.runAs("B", ...)  →  SELECT sum(amount) FROM invoice</text>
+
+    <rect x="220" y="180" width="560" height="60" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="500" y="206" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">Executor her satırda RLS politikasını çalıştırır</text>
+    <text x="500" y="228" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#57606a">rol: tg_app  ·  politika: tg_observer</text>
+
+    <rect x="220" y="280" width="560" height="60" rx="12" fill="#fff8c5" stroke="#d4a72c"/>
+    <text x="500" y="306" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">Politika hep true döner, ama bir mesaj atar</text>
+    <text x="500" y="328" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#7d4e00">RAISE NOTICE 'tg|invoice|A'</text>
+
+    <rect x="220" y="380" width="560" height="60" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="500" y="406" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">Sürücü mesajı uyarı zincirine ekler</text>
+    <text x="500" y="428" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#57606a">Statement / ResultSet → SQLWarning</text>
+
+    <rect x="220" y="480" width="560" height="60" rx="12" fill="#ddf4ff" stroke="#54aeff"/>
+    <text x="500" y="506" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">JDBC proxy zinciri okur, asla temizlemez</text>
+    <text x="500" y="528" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#0550ae">execute öncesi/sonrası · fetch · clearWarnings · close</text>
+
+    <rect x="220" y="580" width="560" height="60" rx="12" fill="#ffebe9" stroke="#cf222e"/>
+    <text x="500" y="606" text-anchor="middle" font-size="17" font-weight="600" fill="#24292f">Aktör B, satır A'nın → bulgu</text>
+    <text x="500" y="628" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#cf222e">Finding ACTOR_MISMATCH (invoice, A)</text>
+  </g>
+
+  <!-- arrows -->
+  <g stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)">
+    <line x1="500" y1="140" x2="500" y2="176"/>
+    <line x1="500" y1="240" x2="500" y2="276"/>
+    <line x1="500" y1="340" x2="500" y2="376"/>
+    <line x1="500" y1="440" x2="500" y2="476"/>
+    <line x1="500" y1="540" x2="500" y2="576"/>
+  </g>
+
+  <!-- side notes -->
+  <g font-size="13" fill="#57606a">
+    <text x="800" y="300">ROLLBACK ve READ ONLY</text>
+    <text x="800" y="318">transaction'larda da</text>
+    <text x="800" y="336">kaybolmaz</text>
+    <text x="800" y="500">Uygulama kendi</text>
+    <text x="800" y="518">uyarılarını görmeye</text>
+    <text x="800" y="536">devam eder</text>
+  </g>
+
+  <rect x="220" y="680" width="560" height="50" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-dasharray="6 5"/>
+  <text x="500" y="711" text-anchor="middle" font-size="15" fill="#57606a">Self-check: probe sorgusu NOTICE üretmezse test hiç başlamaz</text>
+</svg>

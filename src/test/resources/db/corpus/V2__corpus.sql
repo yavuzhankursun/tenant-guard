@@ -21,9 +21,15 @@ CREATE TABLE corpus_line (
 CREATE VIEW corpus_invoice_view AS
     SELECT id, tenant_id, name, amount FROM corpus_invoice;
 
--- PG15+: base-table RLS is checked as the querying role.
-CREATE VIEW corpus_invoice_invoker_view WITH (security_invoker = true) AS
-    SELECT id, tenant_id, name, amount FROM corpus_invoice;
+-- PG15+: base-table RLS is checked as the querying role. Older servers reject the option, so the
+-- view exists on 15+ only and LeakCorpusTest skips row 23b when it is missing.
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::int >= 150000 THEN
+    EXECUTE 'CREATE VIEW corpus_invoice_invoker_view WITH (security_invoker = true) AS '
+         || 'SELECT id, tenant_id, name, amount FROM corpus_invoice';
+  END IF;
+END $$;
 
 -- SECURITY INVOKER (the default): the body runs as the caller.
 CREATE FUNCTION corpus_total() RETURNS numeric LANGUAGE sql STABLE AS $$

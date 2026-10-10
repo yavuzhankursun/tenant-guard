@@ -2,6 +2,7 @@ package dev.tenantguard.corpus;
 
 import dev.tenantguard.Extremes;
 import dev.tenantguard.TenantGuard;
+import dev.tenantguard.TestPostgres;
 import dev.tenantguard.junit.TenantIsolationTest;
 import dev.tenantguard.sample.SampleApp;
 import java.math.BigDecimal;
@@ -37,7 +38,7 @@ abstract class CorpusTestBase {
     static final List<Long> VICTIM_IDS = List.of(101L, 102L);
     static final long VICTIM_ID = VICTIM_IDS.get(0);
 
-    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+    static final PostgreSQLContainer<?> POSTGRES = TestPostgres.container();
 
     static {
         POSTGRES.start();

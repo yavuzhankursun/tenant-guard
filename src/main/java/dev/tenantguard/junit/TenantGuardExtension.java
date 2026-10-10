@@ -11,6 +11,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.extension.AfterEachCallback;
 import org.junit.jupiter.api.extension.BeforeEachCallback;
@@ -50,8 +51,9 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
         TenantIsolationTest settings = settings(context);
         ApplicationContext spring = SpringExtension.getApplicationContext(context);
         TenantGuard guard = spring.getBean(TenantGuard.class);
-        DataSource dataSource = guardedDataSource(spring);
-        List<String> warnings = SchedulingCheck.warnings(spring);
+        ObservedDataSources dataSources = ObservedDataSources.select(spring, settings.dataSources(), guard);
+        List<String> warnings = Stream.concat(dataSources.warnings().stream(), SchedulingCheck.warnings(spring).stream())
+                .toList();
         warnings.forEach(warning -> LOG.log(warning.equals(SchedulingCheck.SUPPRESSED)
                 ? System.Logger.Level.INFO : System.Logger.Level.WARNING, warning));
 
@@ -63,11 +65,11 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                 seeder.seed(settings.victim());
                 seeder.seed(settings.attacker());
             });
-            TableDiscovery.Result tables = install(dataSource, settings.tenantColumn(), settings.tables(),
+            TableDiscovery.Result tables = dataSources.install(settings.tenantColumn(), settings.tables(),
                     settings.schemas());
             guard.activate();
             if (settings.selfCheck()) {
-                selfCheck(dataSource, guard);
+                dataSources.selfCheck(guard);
             }
             guard.reset();
             context.getStore(NAMESPACE).put(ObserverSetup.class, new ObserverSetup(
@@ -136,8 +138,10 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                     LOG.log(System.Logger.Level.WARNING, "TenantGuard does not observe table ''{0}'': {1}", table, reason));
             if (tables.tables().isEmpty()) {
                 String where = schemas.length == 0 ? "the search_path's schemas" : "schemas " + List.of(schemas);
-                throw new IllegalStateException("TenantGuard is blind: no observable table in %s has column '%s' (skipped: %s)"
-                        .formatted(where, column, tables.skipped()));
+                throw new IllegalStateException(("TenantGuard is blind: no observable table in %s has column '%s' "
+                        + "(skipped: %s).%nIt observes shared tables that carry the tenant in a column; "
+                        + "schema-per-tenant designs without one (Hibernate schema multi-tenancy, a schema or database "
+                        + "per tenant) are out of scope.").formatted(where, column, tables.skipped()));
             }
             installAs(owner, column, tables.tables());
             return tables;
@@ -188,14 +192,17 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
             throw new IllegalStateException("TenantGuard found no DataSource bean: check spring.datasource.url/username/"
                     + "password (or the environment keys your app reads them from) in the test context.", e);
         }
+        requireGuarded(names.size() == 1 ? names.getFirst() : "@Primary of " + names, dataSource);
+        return dataSource;
+    }
+
+    static void requireGuarded(String name, DataSource dataSource) throws SQLException {
         if (!dataSource.isWrapperFor(GuardedDataSource.class)) {
             throw new IllegalStateException(("The DataSource bean '%s' (%s) is not a GuardedDataSource: import "
                     + "TenantGuardConfiguration (@TenantIsolationTest does that), and check which bean created the "
                     + "DataSource; one built outside the context or replaced after post-processing is never wrapped.")
-                    .formatted(names.size() == 1 ? names.getFirst() : "@Primary of " + names,
-                            dataSource.getClass().getSimpleName()));
+                    .formatted(name, dataSource.getClass().getSimpleName()));
         }
-        return dataSource;
     }
 
     /** Looks at the test class, its superclasses ({@code @Inherited}) and, for {@code @Nested}, enclosing classes. */

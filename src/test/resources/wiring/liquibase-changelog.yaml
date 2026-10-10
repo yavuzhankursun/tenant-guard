@@ -1,0 +1,22 @@
+# Same invoice tables as db/migration/V1__schema.sql, created by Liquibase instead of Flyway.
+databaseChangeLog:
+  - changeSet:
+      id: 1-invoice
+      author: tenant-guard
+      changes:
+        - sql:
+            sql: >-
+              CREATE TABLE invoice (
+                  id        bigserial PRIMARY KEY,
+                  tenant_id text    NOT NULL,
+                  number    text    NOT NULL,
+                  amount    numeric NOT NULL
+              )
+        - sql:
+            sql: >-
+              CREATE TABLE invoice_line (
+                  id          bigserial PRIMARY KEY,
+                  tenant_id   text   NOT NULL,
+                  invoice_id  bigint NOT NULL REFERENCES invoice (id),
+                  description text   NOT NULL
+              )

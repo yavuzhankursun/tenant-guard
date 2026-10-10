@@ -19,7 +19,7 @@ import org.springframework.scheduling.annotation.SchedulingConfigurer;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 
 /**
- * Test-only wiring: one {@link TenantGuard} and every {@link DataSource} bean wrapped in a
+ * Test-only wiring: one {@link TenantGuard} and every {@link DataSource} bean guarded by a
  * {@link GuardedDataSource}. Nothing else in the application changes; while the guard is inactive
  * the wrapper resets the role, so Flyway and seeders run with the app's own credentials.
  * Imported by {@code @TenantIsolationTest}; never put it on a production component scan path.
@@ -38,14 +38,20 @@ public class TenantGuardConfiguration {
         return new TenantGuard();
     }
 
-    /** Static: a post-processor must not force its declaring configuration to initialize early. */
+    /**
+     * Static: a post-processor must not force its declaring configuration to initialize early. Spring's
+     * DataSource proxies keep their type and get the guard under them, on the pool (see
+     * {@link SpringDataSources} for why the order matters); a bean that already reaches a guard, e.g. a
+     * proxy over a pool bean, is left alone so no row is observed twice.
+     */
     @Bean
     static BeanPostProcessor tenantGuardDataSourceWrapper(ObjectProvider<TenantGuard> guard) {
         return new BeanPostProcessor() {
             @Override
             public Object postProcessAfterInitialization(Object bean, String beanName) {
-                if (bean instanceof DataSource dataSource && !(bean instanceof GuardedDataSource)) {
-                    return new GuardedDataSource(dataSource, guard.getObject(), ObserverInstaller.ROLE);
+                if (bean instanceof DataSource dataSource) {
+                    return SpringDataSources.guard(dataSource,
+                            target -> new GuardedDataSource(target, guard.getObject(), ObserverInstaller.ROLE));
                 }
                 return bean;
             }

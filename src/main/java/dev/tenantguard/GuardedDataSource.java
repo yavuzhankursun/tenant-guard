@@ -12,12 +12,16 @@ import javax.sql.DataSource;
  * While the guard is active, every borrowed connection switches to the observed role, so the
  * application's own credentials (and Flyway's) stay untouched. While inactive it resets the role,
  * so migrations and seeders run as the owner and bypass the observer.
+ *
+ * <p>A connection that is already observed, because another guard sits under this one, is handed
+ * out as it is: one row read must be reported once.
  */
 public final class GuardedDataSource implements DataSource {
 
     private final DataSource delegate;
     private final TenantGuard guard;
     private final String role;
+    private volatile boolean observing = true;
 
     /** @param role role to {@code SET ROLE} to while active; null keeps the connecting user (used to prove the self-check). */
     public GuardedDataSource(DataSource delegate, TenantGuard guard, String role) {
@@ -36,18 +40,36 @@ public final class GuardedDataSource implements DataSource {
         return prepare(delegate.getConnection(username, password));
     }
 
+    /**
+     * Off: behaves as if the guard were inactive (role reset, nothing observed). The JUnit extension
+     * turns off the DataSources a test does not observe, so their reads run as the app's own user
+     * instead of failing on a database without the observer, exactly as its warning says.
+     */
+    public void setObserving(boolean observing) {
+        this.observing = observing;
+    }
+
+    public boolean isObserving() {
+        return observing;
+    }
+
     private Connection prepare(Connection connection) throws SQLException {
-        try (Statement statement = connection.createStatement()) {
-            statement.execute(sessionSetup());
+        try {
+            if (ObservingConnectionHandler.isObserved(connection)) {
+                return connection;
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sessionSetup());
+            }
         } catch (SQLException e) {
             connection.close();
             throw e;
         }
-        return ObservingConnectionHandler.wrap(connection, guard);
+        return observing ? ObservingConnectionHandler.wrap(connection, guard) : connection;
     }
 
     private String sessionSetup() {
-        if (!guard.isActive()) {
+        if (!guard.isActive() || !observing) {
             return "RESET ROLE";
         }
         // The app may raise client_min_messages; notices are the only channel that survives rollback and READ ONLY.

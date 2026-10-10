@@ -14,8 +14,9 @@ import java.util.TreeMap;
 
 /**
  * Finds the tables to observe: every base table in the current schema that has the tenant column.
- * Tables the observer cannot be installed on are returned as skipped, with the reason, instead of
- * failing the whole run; explicit table lists still go through {@link ObserverInstaller}'s refusal.
+ * Tables the observer cannot be installed on (unsupported identifiers, RLS policies that never grant
+ * the observed role anything) are returned as skipped, with the reason, instead of failing the whole
+ * run; explicit table lists still go through {@link ObserverInstaller}'s refusal.
  */
 public final class TableDiscovery {
 
@@ -78,8 +79,11 @@ public final class TableDiscovery {
         } catch (IllegalArgumentException e) {
             return Optional.of("unsupported identifier: only unquoted lower-case table names are observed");
         }
-        return ObserverInstaller.foreignPolicy(owner, table).map(policy -> ("existing RLS policy '%s': "
-                + "a permissive observer policy would be OR-ed with it and switch the app's own isolation off")
-                .formatted(policy));
+        try {
+            ObserverInstaller.policyKind(owner, table);
+            return Optional.empty();
+        } catch (IllegalStateException e) {
+            return Optional.of(e.getMessage());
+        }
     }
 }

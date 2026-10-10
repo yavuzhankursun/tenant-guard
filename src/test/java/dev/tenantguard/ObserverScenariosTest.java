@@ -99,12 +99,50 @@ class ObserverScenariosTest extends GuardedTestBase {
     }
 
     @Test
-    @DisplayName("6. Mevcut RLS politikası olan tablo: kurulum açık hatayla durur")
-    void existingPolicyIsRefused() throws Exception {
-        try (Connection owner = ownerConnection()) {
-            assertThatThrownBy(() -> ObserverInstaller.install(owner, "tenant_id", List.of("legacy_doc")))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("legacy_isolation");
+    @DisplayName("6a. Mevcut permissive RLS politikası olan tablo: observer RESTRICTIVE kurulur, izolasyon bozulmaz")
+    void existingPolicyGetsRestrictiveObserverAndStaysIsolated() throws Exception {
+        try (Connection owner = ownerConnection(); java.sql.Statement sql = owner.createStatement()) {
+            sql.execute("TRUNCATE legacy_doc");
+            sql.execute("INSERT INTO legacy_doc (tenant_id, title) VALUES ('A', 'a-doc'), ('B', 'b-doc')");
+            assertThat(ObserverInstaller.policyKind(owner, "legacy_doc")).isEqualTo(ObserverInstaller.PolicyKind.RESTRICTIVE);
+            ObserverInstaller.install(owner, "tenant_id", List.of("legacy_doc"));
+        }
+        guard.reset();
+
+        List<String> asB = guard.callAs(TENANT_B, () -> jdbc.execute((Connection c) -> {
+            try (java.sql.Statement st = c.createStatement()) {
+                st.execute("SET app.tenant = 'B'");
+                try (java.sql.ResultSet rs = st.executeQuery("SELECT title FROM legacy_doc ORDER BY title")) {
+                    List<String> titles = new java.util.ArrayList<>();
+                    while (rs.next()) {
+                        titles.add(rs.getString(1));
+                    }
+                    return titles;
+                } finally {
+                    st.execute("RESET app.tenant");
+                }
+            }
+        }));
+
+        assertThat(asB).as("the app's own policy still filters").containsExactly("b-doc");
+        assertThat(guard.observations()).as("the observer still sees the rows that pass it").isNotEmpty();
+        assertThat(guard.findings(Rule.ACTOR_MISMATCH)).as("A's row was rejected before the observer").isEmpty();
+    }
+
+    @Test
+    @DisplayName("6b. Yalnızca restrictive politikası olan tablo: observer hiçbir şey göremez, kurulum reddedilir")
+    void tableWithoutAnyPermissivePolicyIsRefused() throws Exception {
+        try (Connection owner = ownerConnection(); java.sql.Statement sql = owner.createStatement()) {
+            sql.execute("CREATE TABLE tg_locked (tenant_id text NOT NULL)");
+            sql.execute("ALTER TABLE tg_locked ENABLE ROW LEVEL SECURITY");
+            sql.execute("CREATE POLICY lock ON tg_locked AS RESTRICTIVE USING (true)");
+            try {
+                assertThatThrownBy(() -> ObserverInstaller.install(owner, "tenant_id", List.of("tg_locked")))
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("none is permissive for role 'tg_app'");
+            } finally {
+                sql.execute("DROP TABLE tg_locked");
+            }
         }
     }
 

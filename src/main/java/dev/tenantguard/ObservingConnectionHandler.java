@@ -7,6 +7,7 @@ import java.lang.reflect.Proxy;
 import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Statement;
 
 /** Wraps every statement a connection creates so its notices reach the guard. */
@@ -27,8 +28,19 @@ final class ObservingConnectionHandler implements InvocationHandler {
                 new ObservingConnectionHandler(target, guard));
     }
 
+    /**
+     * Whether {@code connection} is, or wraps, an observing proxy: a guard under a proxy that was itself
+     * guarded (a routing DataSource over guarded pool beans) already set the role and observes it.
+     */
+    static boolean isObserved(Connection connection) throws SQLException {
+        return connection.isWrapperFor(ObservingConnectionHandler.class);
+    }
+
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        if ("isWrapperFor".equals(method.getName()) && args[0] == ObservingConnectionHandler.class) {
+            return true;
+        }
         // unwrap(Connection.class) would otherwise hand out the raw driver connection, whose statements
         // nobody observes. Driver-specific types (PgConnection) still get the raw object: a known blind spot.
         if ("unwrap".equals(method.getName()) && ((Class<?>) args[0]).isInstance(proxy)) {

@@ -45,7 +45,15 @@ public final class ObserverInstaller {
                     CREATE ROLE %1$s NOLOGIN NOSUPERUSER NOBYPASSRLS;
                   END IF;
                 END $$""".formatted(ROLE),
-                "GRANT " + ROLE + " TO CURRENT_USER",
+                // Granting needs ADMIN on the role. An app role that is not a superuser was usually granted
+                // tg_app once by whoever created it, and may not grant it again. PG16 split SET from membership.
+                """
+                DO $$ BEGIN
+                  IF NOT pg_has_role(current_user, '%1$s',
+                      CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'SET' ELSE 'MEMBER' END) THEN
+                    GRANT %1$s TO CURRENT_USER;
+                  END IF;
+                END $$""".formatted(ROLE),
                 """
                 CREATE OR REPLACE FUNCTION tg_observe(tbl text, row_tenant text) RETURNS boolean
                 LANGUAGE plpgsql VOLATILE AS $$

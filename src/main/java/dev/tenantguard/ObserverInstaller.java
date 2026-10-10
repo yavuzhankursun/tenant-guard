@@ -7,6 +7,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
@@ -74,18 +75,24 @@ public final class ObserverInstaller {
      * silently switch the app's own isolation off. RESTRICTIVE support is post-MVP; refuse for now.
      */
     private static void refuseForeignPolicies(Connection owner, List<String> tables) throws SQLException {
+        for (String table : tables) {
+            Optional<String> policy = foreignPolicy(owner, table);
+            if (policy.isPresent()) {
+                throw new IllegalStateException(("Table '%s' already has RLS policy '%s'. TenantGuard "
+                        + "does not support tables with existing policies yet.").formatted(table, policy.get()));
+            }
+        }
+    }
+
+    /** The first RLS policy on {@code table} that is not the observer, if any. */
+    static Optional<String> foreignPolicy(Connection owner, String table) throws SQLException {
         String sql = "SELECT policyname FROM pg_policies "
-                + "WHERE schemaname = current_schema() AND tablename = ? AND policyname <> ?";
+                + "WHERE schemaname = current_schema() AND tablename = ? AND policyname <> ? ORDER BY policyname";
         try (PreparedStatement statement = owner.prepareStatement(sql)) {
-            for (String table : tables) {
-                statement.setString(1, table);
-                statement.setString(2, POLICY);
-                try (ResultSet rs = statement.executeQuery()) {
-                    if (rs.next()) {
-                        throw new IllegalStateException(("Table '%s' already has RLS policy '%s'. TenantGuard "
-                                + "does not support tables with existing policies yet.").formatted(table, rs.getString(1)));
-                    }
-                }
+            statement.setString(1, table);
+            statement.setString(2, POLICY);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() ? Optional.of(rs.getString(1)) : Optional.empty();
             }
         }
     }

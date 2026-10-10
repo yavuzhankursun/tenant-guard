@@ -33,16 +33,31 @@ import org.springframework.context.annotation.Import;
 @Import(TenantGuardConfiguration.class)
 public @interface TenantIsolationTest {
 
-    /** Column holding the tenant id, e.g. {@code tenant_id}. Unquoted lower-case identifier. */
+    /**
+     * Column holding the tenant id, e.g. {@code tenant_id} or {@code company_id}, of any type whose
+     * {@code ::text} form identifies the tenant (text, integer, bigint, uuid). Case-sensitive, as in
+     * the catalog; letters, digits, {@code _} and {@code $} only. Act as a tenant with its canonical
+     * text form: {@code "2"}, not {@code "02"}; lower-case dashed uuids ({@code UUID.toString()}).
+     */
     String tenantColumn();
 
     /**
-     * Tables to observe. Empty (the default): every base table of the current schema that has
-     * {@link #tenantColumn()}, except {@code tg_probe} and {@code flyway_schema_history}; tables that
-     * already have an RLS policy are skipped and reported in {@link ObserverSetup#skippedTables()}.
-     * Explicit tables with an existing policy fail the test instead.
+     * Tables to observe, {@code table} or {@code schema.table}, case-sensitive as in the catalog
+     * ({@code "MixedCase"} needs no extra quotes). Empty (the default): every base table in
+     * {@link #schemas()} that has {@link #tenantColumn()}, except {@code tg_probe} and
+     * {@code flyway_schema_history}; tables whose RLS policies never grant the observed role anything,
+     * and names outside the identifier allowlist, are skipped and reported in
+     * {@link ObserverSetup#skippedTables()}. Explicit tables with such a policy fail the test instead.
      */
     String[] tables() default {};
+
+    /**
+     * Schemas auto-discovery searches. Empty (the default): every schema on the app connection's
+     * search_path. Name a schema here to observe tables the app reaches schema-qualified, off the
+     * path; the observed role is granted access to it. Tables are reported as {@code schema.table}
+     * unless the bare name resolves to them from the app's search_path.
+     */
+    String[] schemas() default {};
 
     /** Tenant whose rows must not leak; seeded first, so a seeder may start by truncating. */
     String victim() default "A";

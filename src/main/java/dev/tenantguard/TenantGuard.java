@@ -39,6 +39,13 @@ public final class TenantGuard {
         return active.get();
     }
 
+    /**
+     * Runs {@code action} with {@code tenant} as the actor. Rows are matched against the tenant
+     * column's {@code ::text} form exactly, with no normalization: {@code "2"} for an integer column,
+     * the lower-case dashed form for a uuid ({@code String.valueOf} of the Java value gives both).
+     * Normalizing numerics would merge distinct tenants of a text column ("02" and "2"); exact
+     * comparison instead makes a mistyped actor fail loudly, reporting its own rows as foreign.
+     */
     public <T> T callAs(String tenant, Supplier<T> action) {
         String previous = actor.getAndSet(tenant);
         try {

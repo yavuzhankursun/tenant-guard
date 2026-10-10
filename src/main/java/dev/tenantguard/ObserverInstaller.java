@@ -43,6 +43,8 @@ public final class ObserverInstaller {
     public static final String ROLE = "tg_app";
     public static final String PROBE_TABLE = "tg_probe";
     static final String POLICY = "tg_observer";
+    static final int LOCK_TIMEOUT_SECONDS = 30;
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
     static final String FUNCTION = "tg_observe";
 
     private ObserverInstaller() {
@@ -102,9 +104,51 @@ public final class ObserverInstaller {
         ddl.addAll(policyDdl(probe, false, "%s('%s', 'tg-probe')".formatted(observe, PROBE_TABLE)));
 
         try (Statement statement = owner.createStatement()) {
-            for (String sql : ddl) {
-                statement.execute(sql);
+            // ENABLE ROW LEVEL SECURITY takes an exclusive lock: a session idle in a transaction on a
+            // tenant table (a leaked test transaction, a pool that does not roll back on return) would
+            // make the install hang forever. Fail instead, and say what to look for.
+            statement.execute("SET lock_timeout = '" + LOCK_TIMEOUT_SECONDS + "s'");
+            try {
+                for (String sql : ddl) {
+                    statement.execute(sql);
+                }
+            } catch (SQLException e) {
+                if (LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                    throw new SQLException(("TenantGuard could not lock a tenant table within %ds to install the "
+                            + "observer: another session holds it (idle in transaction? a connection pool that "
+                            + "does not roll back on return?). Holders: %s. %s")
+                            .formatted(LOCK_TIMEOUT_SECONDS, lockHolders(owner), e.getMessage()), e.getSQLState(), e);
+                }
+                throw e;
+            } finally {
+                statement.execute("RESET lock_timeout");
             }
+        }
+    }
+
+    /**
+     * Other sessions holding relation locks, for the lock-timeout message. Best effort: on a
+     * connection whose transaction the failed DDL aborted, the catalog query fails too.
+     */
+    private static String lockHolders(Connection owner) {
+        String sql = """
+                SELECT a.pid, a.state, coalesce(a.application_name, ''), l.mode, l.relation::regclass::text,
+                       left(coalesce(a.query, ''), 160)
+                FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                WHERE l.locktype = 'relation' AND l.granted AND a.pid <> pg_backend_pid()
+                  AND l.relation::regclass::text NOT LIKE 'pg_%'
+                ORDER BY a.pid LIMIT 10""";
+        try (Statement statement = owner.createStatement(); ResultSet rs = statement.executeQuery(sql)) {
+            StringBuilder holders = new StringBuilder();
+            while (rs.next()) {
+                holders.append(holders.isEmpty() ? "" : "; ")
+                        .append("pid ").append(rs.getInt(1)).append(' ').append(rs.getString(2))
+                        .append(" app='").append(rs.getString(3)).append("' ").append(rs.getString(4))
+                        .append(" on ").append(rs.getString(5)).append(" last query: ").append(rs.getString(6));
+            }
+            return holders.isEmpty() ? "none visible" : holders.toString();
+        } catch (SQLException e) {
+            return "unknown (" + e.getMessage() + ")";
         }
     }
 

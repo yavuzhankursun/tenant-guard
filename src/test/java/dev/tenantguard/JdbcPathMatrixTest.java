@@ -349,6 +349,12 @@ class JdbcPathMatrixTest extends GuardedTestBase {
 
     /** Two wrappers over one driver ResultSet must not count the same fetch notices twice. */
     void cursorResultFetchedTwice() throws SQLException {
+        // c3p0 throws its own InternalError on a second wrapper of one result, guard or not:
+        // PoolMatrixTest.c3p0RejectsTwoWrappersOfOneResult pins that behaviour.
+        org.junit.jupiter.api.Assumptions.assumeFalse(
+                dev.tenantguard.sample.pool.TestPool.of(System.getProperty(dev.tenantguard.sample.pool.TestPool.PROPERTY))
+                        == dev.tenantguard.sample.pool.TestPool.C3P0,
+                "c3p0 rejects executeQuery + getResultSet on one result (its own InternalError)");
         inTransaction(c -> {
             try (Statement s = c.createStatement()) {
                 s.setFetchSize(1);

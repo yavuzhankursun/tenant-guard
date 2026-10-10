@@ -217,8 +217,12 @@ class ObserverScenariosTest extends GuardedTestBase {
                             count++;
                         }
                     }
-                    connection.rollback();
                     return count;
+                } finally {
+                    // Pools other than Hikari return the connection as it is: a transaction left open
+                    // here holds a share lock on invoice and blocks the next observer install.
+                    connection.rollback();
+                    connection.setAutoCommit(true);
                 }
             } catch (java.sql.SQLException e) {
                 throw new IllegalStateException(e);

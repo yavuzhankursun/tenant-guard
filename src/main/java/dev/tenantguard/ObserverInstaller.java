@@ -1,5 +1,6 @@
 package dev.tenantguard;
 
+import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -7,6 +8,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -15,21 +17,43 @@ import java.util.Set;
 
 /**
  * Installs the observer: a non-owner, non-bypass role and a policy that always returns true but
- * raises a NOTICE for every row the executor reads. No FORCE ROW LEVEL SECURITY: the owner
- * (migrations, seeder) must bypass the observer, only the role the app switches into is watched.
- * Must run as the table owner or a superuser, after the schema exists.
+ * raises a NOTICE for every row the executor reads (USING) and every row a statement writes
+ * (WITH CHECK). No FORCE ROW LEVEL SECURITY: the owner (migrations, seeder) must bypass the
+ * observer, only the role the app switches into is watched. Must run as the table owner or a
+ * superuser, after the schema exists.
  *
  * <p>On a table that already has its own permissive policy the observer is created
  * {@code AS RESTRICTIVE}: Postgres ORs permissive policies, so a permissive always-true observer
  * would switch the app's isolation off, while a restrictive one is AND-ed and leaves it intact.
- * Rows the app's policy rejects are then never observed, which is right: they did not leak.
+ * Rows the app's policy rejects are then never observed, which is right: they did not leak. The
+ * same holds for writes: the app's WITH CHECK still rejects a foreign row.
  *
- * <p>Location: {@code tg_observe} and {@code tg_probe} go into the installing connection's current
- * schema (the first existing schema on its search_path, where an unqualified CREATE would go), and
- * every policy calls the function schema-qualified, so a table in any schema can be observed. The
- * observed role gets USAGE and table privileges on the search_path's schemas and on every schema
- * holding an observed table, not on a hard-coded {@code public}: with {@code search_path = tenancy}
- * a public-only grant hid the probe itself ("relation tg_probe does not exist").
+ * <p>Writes: an INSERT reports its new rows, an UPDATE its old rows as reads and its new rows as
+ * writes (and, when it needs SELECT rights, the new rows as reads too: Postgres checks that they
+ * stay visible). A DELETE has no new row, so a foreign delete is only seen as a read.
+ *
+ * <p>Notices: {@code tg:<nonce>|r|<table>|<tenant>} for reads, {@code |w|} for writes. Every
+ * install bakes a fresh random nonce into both functions and returns it ({@link Installation});
+ * {@link RowRead#parse} accepts only nonces the guard trusts, so the app's own
+ * {@code RAISE NOTICE 'tg|...'}, or a tenant-controlled string the app raises, is never an
+ * observation. The nonce is in {@code pg_proc.prosrc}, readable by any role: it keeps strings out,
+ * not code that runs arbitrary SQL against the catalog. Re-installing replaces the functions in
+ * place, so pooled connections keep working and raise the new nonce from their next statement.
+ *
+ * <p>Location: {@code tg_observe}, {@code tg_observe_write} and {@code tg_probe} go into the
+ * installing connection's current schema (the first existing schema on its search_path, where an
+ * unqualified CREATE would go), and every policy calls the functions schema-qualified, so a table
+ * in any schema can be observed. The observed role gets USAGE and table privileges on the
+ * search_path's schemas and on every schema holding an observed table, not on a hard-coded
+ * {@code public}: with {@code search_path = tenancy} a public-only grant hid the probe itself
+ * ("relation tg_probe does not exist").
+ *
+ * <p>Tables created later: {@code GRANT ... ON ALL TABLES} covers existing tables only, so the
+ * installing role's default privileges in those schemas grant the observed role every table and
+ * sequence it creates afterwards. Without them, a fixture table a test creates after the install
+ * fails with "permission denied" while the guard is active. Such a table has no policy and is not
+ * observed until the next install names it. Default privileges live in {@code pg_default_acl}:
+ * dropping {@code tg_app} later needs {@code DROP OWNED BY tg_app} first.
  *
  * <p>Every app-chosen name (table, schema, tenant column) is resolved against the catalog and
  * double-quoted, so mixed-case and reserved-word names work; see {@link Identifiers#quote}.
@@ -46,17 +70,47 @@ public final class ObserverInstaller {
     static final int LOCK_TIMEOUT_SECONDS = 30;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     static final String FUNCTION = "tg_observe";
+    static final String WRITE_FUNCTION = "tg_observe_write";
+    private static final int NONCE_BYTES = 16;
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     private ObserverInstaller() {
     }
 
     /**
+     * What one install wrote: hand it to {@link TenantGuard#trust} so the guard accepts its notices.
+     *
+     * @param location where the observer functions live (server, database, schema); a re-install at
+     *                 the same location replaces the functions, and so the trusted nonce
+     * @param nonce    32 lower-case hex digits from a CSPRNG, the signature of every notice
+     */
+    public record Installation(String location, String nonce) {
+
+        public Installation {
+            if (location == null) {
+                throw new IllegalArgumentException("location is required");
+            }
+            if (nonce == null || !nonce.matches("[0-9a-f]{" + NONCE_BYTES * 2 + "}")) {
+                throw new IllegalArgumentException("nonce must be " + NONCE_BYTES * 2 + " lower-case hex digits");
+            }
+        }
+
+        /** Without the nonce: it ends up in logs, and in a log it is half a forgery kit. */
+        @Override
+        public String toString() {
+            return "Installation[location=" + location + "]";
+        }
+    }
+
+    /**
      * @param tables {@code table} or {@code schema.table}, case-sensitive as in the catalog; bare names
      *               resolve through the owner connection's search_path
+     * @return the nonce the observer now signs with; the guard ignores the notices until it trusts it
      */
-    public static void install(Connection owner, String tenantColumn, List<String> tables) throws SQLException {
+    public static Installation install(Connection owner, String tenantColumn, List<String> tables) throws SQLException {
         String column = Identifiers.quote(tenantColumn);
-        String home = Identifiers.quote(currentSchema(owner));
+        String homeSchema = currentSchema(owner);
+        String home = Identifiers.quote(homeSchema);
         Map<ObservedTable, Boolean> restrictive = new LinkedHashMap<>();
         for (String table : tables) {
             ObservedTable observed = ObservedTable.resolve(owner, table);
@@ -64,8 +118,31 @@ public final class ObserverInstaller {
         }
         String probe = home + "." + Identifiers.quote(PROBE_TABLE);
         String observe = home + "." + Identifiers.quote(FUNCTION);
+        String observeWrite = home + "." + Identifiers.quote(WRITE_FUNCTION);
+        String nonce = newNonce();
 
-        List<String> ddl = new ArrayList<>(List.of(
+        List<String> ddl = new ArrayList<>(roleDdl());
+        ddl.add(functionDdl(observe, nonce, RowRead.Kind.READ));
+        ddl.add(functionDdl(observeWrite, nonce, RowRead.Kind.WRITE));
+        // The probe's policy does not read its column: a probe left behind by an install with
+        // another tenant column (company_id, then tenant_id) must keep working.
+        ddl.add("CREATE TABLE IF NOT EXISTS %s (tenant text NOT NULL)".formatted(probe));
+        ddl.add("INSERT INTO %1$s SELECT 'tg-probe' WHERE NOT EXISTS (SELECT 1 FROM %1$s)".formatted(probe));
+        grantedSchemas(owner, restrictive.keySet()).forEach(schema -> ddl.addAll(grantDdl(Identifiers.quote(schema))));
+        // Labels are allowlisted identifiers joined by '.', so they cannot break out of the literal.
+        restrictive.forEach((table, asRestrictive) -> ddl.addAll(policyDdl(table.sql(), asRestrictive,
+                "%s('%s', %s::text)".formatted(observe, table.label(), column),
+                "%s('%s', %s::text)".formatted(observeWrite, table.label(), column))));
+        // Nothing writes the probe; WITH CHECK (true) keeps it out of the write channel.
+        ddl.addAll(policyDdl(probe, false, "%s('%s', 'tg-probe')".formatted(observe, PROBE_TABLE), "true"));
+
+        Installation installation = new Installation(location(owner, homeSchema), nonce);
+        execute(owner, ddl);
+        return installation;
+    }
+
+    private static List<String> roleDdl() {
+        return List.of(
                 """
                 DO $$ BEGIN
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '%1$s') THEN
@@ -80,29 +157,53 @@ public final class ObserverInstaller {
                       CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'SET' ELSE 'MEMBER' END) THEN
                     GRANT %1$s TO CURRENT_USER;
                   END IF;
-                END $$""".formatted(ROLE),
-                """
+                END $$""".formatted(ROLE));
+    }
+
+    /** The nonce is hex and the kind code a letter, so neither can break out of the literal. */
+    private static String functionDdl(String function, String nonce, RowRead.Kind kind) {
+        return """
                 CREATE OR REPLACE FUNCTION %s(tbl text, row_tenant text) RETURNS boolean
                 LANGUAGE plpgsql VOLATILE AS $$
                 BEGIN
-                  RAISE NOTICE 'tg|%%|%%', tbl, row_tenant;
+                  RAISE NOTICE '%s%s|%s|%%|%%', tbl, row_tenant;
                   RETURN true;
-                END $$""".formatted(observe),
-                // The probe's policy does not read its column: a probe left behind by an install with
-                // another tenant column (company_id, then tenant_id) must keep working.
-                "CREATE TABLE IF NOT EXISTS %s (tenant text NOT NULL)".formatted(probe),
-                "INSERT INTO %1$s SELECT 'tg-probe' WHERE NOT EXISTS (SELECT 1 FROM %1$s)".formatted(probe)));
-        for (String schema : grantedSchemas(owner, restrictive.keySet())) {
-            String quoted = Identifiers.quote(schema);
-            ddl.add("GRANT USAGE ON SCHEMA %s TO %s".formatted(quoted, ROLE));
-            ddl.add("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s".formatted(quoted, ROLE));
-            ddl.add("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s".formatted(quoted, ROLE));
-        }
-        // Labels are allowlisted identifiers joined by '.', so they cannot break out of the literal.
-        restrictive.forEach((table, asRestrictive) -> ddl.addAll(policyDdl(table.sql(), asRestrictive,
-                "%s('%s', %s::text)".formatted(observe, table.label(), column))));
-        ddl.addAll(policyDdl(probe, false, "%s('%s', 'tg-probe')".formatted(observe, PROBE_TABLE)));
+                END $$""".formatted(function, RowRead.PREFIX, nonce, kind.code());
+    }
 
+    /** Existing objects now, and through the installing role's default privileges, the ones it creates later. */
+    private static List<String> grantDdl(String schema) {
+        return List.of(
+                "GRANT USAGE ON SCHEMA %s TO %s".formatted(schema, ROLE),
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s".formatted(schema, ROLE),
+                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s".formatted(schema, ROLE),
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s"
+                        .formatted(schema, ROLE),
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT USAGE, SELECT ON SEQUENCES TO %s".formatted(schema, ROLE));
+    }
+
+    private static String newNonce() {
+        byte[] bytes = new byte[NONCE_BYTES];
+        RANDOM.nextBytes(bytes);
+        return HexFormat.of().formatHex(bytes);
+    }
+
+    /**
+     * Server and database as the client names them (the JDBC URL without its parameters, which may
+     * carry credentials), plus the schema the functions live in. Two DataSources on one database
+     * under different URLs get two locations; both nonces stay trusted, the stale one harmlessly.
+     */
+    private static String location(Connection owner, String homeSchema) throws SQLException {
+        String url = owner.getMetaData().getURL();
+        String server = url == null ? "" : url.split("\\?", 2)[0];
+        try (Statement statement = owner.createStatement();
+             ResultSet rs = statement.executeQuery("SELECT current_database()")) {
+            rs.next();
+            return server + "|" + rs.getString(1) + "|" + homeSchema;
+        }
+    }
+
+    private static void execute(Connection owner, List<String> ddl) throws SQLException {
         try (Statement statement = owner.createStatement()) {
             // ENABLE ROW LEVEL SECURITY takes an exclusive lock: a session idle in a transaction on a
             // tenant table (a leaked test transaction, a pool that does not roll back on return) would
@@ -184,13 +285,12 @@ public final class ObserverInstaller {
         return schemas;
     }
 
-    private static List<String> policyDdl(String table, boolean restrictive, String observe) {
+    private static List<String> policyDdl(String table, boolean restrictive, String observe, String check) {
         return List.of(
                 "ALTER TABLE %s ENABLE ROW LEVEL SECURITY".formatted(table),
                 "DROP POLICY IF EXISTS %s ON %s".formatted(POLICY, table),
-                // WITH CHECK (true): the write side is out of MVP scope.
-                "CREATE POLICY %s ON %s AS %s FOR ALL TO %s USING (%s) WITH CHECK (true)"
-                        .formatted(POLICY, table, restrictive ? "RESTRICTIVE" : "PERMISSIVE", ROLE, observe));
+                "CREATE POLICY %s ON %s AS %s FOR ALL TO %s USING (%s) WITH CHECK (%s)"
+                        .formatted(POLICY, table, restrictive ? "RESTRICTIVE" : "PERMISSIVE", ROLE, observe, check));
     }
 
     /** How the observer must be created on {@code table} given the policies already on it. */

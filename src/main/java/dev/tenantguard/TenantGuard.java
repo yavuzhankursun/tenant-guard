@@ -14,6 +14,11 @@ import java.util.function.Supplier;
 /**
  * Process-wide guard state. The actor is global rather than thread-local on purpose: the scanner
  * issues one request at a time, so the tenant context survives {@code @Async} and thread pools.
+ *
+ * <p>Trust: a notice counts only if it carries the nonce of an install this guard was told about
+ * ({@link #trust}). The guard keeps the current nonce of each observed database, a handful at most:
+ * several DataSources, routing targets, or schemas each have their own observer function, and a
+ * re-install replaces only its own location's nonce, exactly as it replaces the function.
  */
 public final class TenantGuard {
 
@@ -26,6 +31,22 @@ public final class TenantGuard {
     private final List<Finding> findings = new CopyOnWriteArrayList<>();
     private final Map<HarvestPoint, LongAdder> harvested = new ConcurrentHashMap<>();
     private final Map<RowRead, LongAdder> reads = new ConcurrentHashMap<>();
+    /** Location of an observer function to the nonce it raises; see {@link ObserverInstaller.Installation}. */
+    private final Map<String, String> nonces = new ConcurrentHashMap<>();
+
+    /**
+     * Accepts the notices of {@code installation} from now on, and stops accepting the nonce its
+     * location had before: the re-install replaced the function, so only a forger could still raise it.
+     * Call it with what {@link ObserverInstaller#install} returned; the JUnit extension does.
+     */
+    public void trust(ObserverInstaller.Installation installation) {
+        nonces.put(installation.location(), installation.nonce());
+    }
+
+    /** Whether notices carrying {@code nonce} are observations. A linear scan: a guard trusts a handful. */
+    boolean trusts(String nonce) {
+        return nonce != null && nonces.containsValue(nonce);
+    }
 
     public void activate() {
         active.set(true);
@@ -81,8 +102,9 @@ public final class TenantGuard {
     }
 
     /**
-     * How often each (table, tenant) row read was observed. Observations collapse rows into sets, so
-     * only this count shows a harvest that lost or double-counted notices.
+     * How often each (table, tenant, kind) row was observed, reads and writes counted apart.
+     * Observations collapse rows into sets, so only this count shows a harvest that lost or
+     * double-counted notices.
      */
     public Map<RowRead, Long> rowReads() {
         Map<RowRead, Long> snapshot = new HashMap<>();
@@ -90,6 +112,7 @@ public final class TenantGuard {
         return Map.copyOf(snapshot);
     }
 
+    /** Forgets what was observed; the trusted nonces stay, they describe the database, not a test. */
     public void reset() {
         observations.clear();
         findings.clear();

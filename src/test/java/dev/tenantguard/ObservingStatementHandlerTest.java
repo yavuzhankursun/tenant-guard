@@ -25,7 +25,7 @@ class ObservingStatementHandlerTest {
     private static final RowRead A = new RowRead("invoice", "A");
     private static final RowRead B = new RowRead("invoice", "B");
 
-    private final TenantGuard guard = new TenantGuard();
+    private final TenantGuard guard = WarningChain.trustingGuard();
     private final WarningChain chain = new WarningChain();
     private final Connection driverConnection = mock(Connection.class);
     private final ResultSet driverResult = mock(ResultSet.class);

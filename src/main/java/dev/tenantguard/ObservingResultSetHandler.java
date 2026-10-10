@@ -83,7 +83,7 @@ final class ObservingResultSetHandler implements InvocationHandler {
     }
 
     private void harvest() throws SQLException {
-        guard.record(sql, cursor.drain(target.getWarnings()), TenantGuard.HarvestPoint.FETCH);
+        guard.record(sql, cursor.drain(target.getWarnings(), guard::trusts), TenantGuard.HarvestPoint.FETCH);
     }
 
     private Object call(Method method, Object[] args) throws Throwable {

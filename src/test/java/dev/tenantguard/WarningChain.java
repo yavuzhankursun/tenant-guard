@@ -8,14 +8,24 @@ import java.sql.SQLWarning;
  */
 final class WarningChain {
 
+    /** The nonce the scripted "observer" signs with; {@link #trustingGuard()} accepts it. */
+    static final String NONCE = "0123456789abcdef0123456789abcdef";
+
     private SQLWarning head;
+
+    /** A guard that trusts this chain's notices, as one would after {@code ObserverInstaller.install}. */
+    static TenantGuard trustingGuard() {
+        TenantGuard guard = new TenantGuard();
+        guard.trust(new ObserverInstaller.Installation("scripted", NONCE));
+        return guard;
+    }
 
     SQLWarning head() {
         return head;
     }
 
     void notice(String table, String tenant) {
-        add(new SQLWarning(RowRead.PREFIX + table + "|" + tenant));
+        add(new SQLWarning(RowRead.PREFIX + NONCE + "|r|" + table + "|" + tenant));
     }
 
     void add(SQLWarning warning) {

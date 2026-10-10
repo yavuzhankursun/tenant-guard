@@ -39,7 +39,7 @@ final class ObservingStatementHandler implements InvocationHandler {
     /** Nothing a fresh driver statement carries; a cached one carries the previous borrower's notices. */
     private void skipLeftovers() {
         try {
-            cursor.drain(target.getWarnings());
+            cursor.drain(target.getWarnings(), guard::trusts);
         } catch (SQLException e) {
             // A wrapper that cannot report warnings yet has none left over; observing must never fail the app.
         }
@@ -109,7 +109,7 @@ final class ObservingStatementHandler implements InvocationHandler {
     }
 
     private void harvest(TenantGuard.HarvestPoint point) throws SQLException {
-        guard.record(sql, cursor.drain(target.getWarnings()), point);
+        guard.record(sql, cursor.drain(target.getWarnings(), guard::trusts), point);
     }
 
     private Object call(Method method, Object[] args) throws Throwable {

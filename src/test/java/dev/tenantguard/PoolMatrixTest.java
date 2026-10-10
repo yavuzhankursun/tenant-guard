@@ -46,6 +46,9 @@ class PoolMatrixTest {
         }
     }
 
+    /** The observer of the matrix database; every test's fresh guard trusts its notices. */
+    private static ObserverInstaller.Installation installation;
+
     @FunctionalInterface
     interface Leak {
         void run(Fixture fixture) throws SQLException;
@@ -80,7 +83,7 @@ class PoolMatrixTest {
         try (Connection owner = DriverManager.getConnection(url(), user(), password());
              Statement s = owner.createStatement()) {
             s.execute("CREATE TABLE invoice (id bigserial PRIMARY KEY, tenant_id text NOT NULL, number text NOT NULL)");
-            ObserverInstaller.install(owner, "tenant_id", List.of("invoice"));
+            installation = ObserverInstaller.install(owner, "tenant_id", List.of("invoice"));
             // A first: with fetchSize=1, A's second row only arrives in a later cursor batch.
             s.execute("INSERT INTO invoice (tenant_id, number) VALUES ('A', 'A-1'), ('A', 'A-2'), ('B', 'B-1'), ('B', 'B-2')");
         }
@@ -191,6 +194,7 @@ class PoolMatrixTest {
         DataSource raw = pool.pool().create(new TestPool.Settings(url(), user(), password(), 1, pool.statementCache()));
         Fixture fixture = new Fixture(new GuardedDataSource(raw, guard, ObserverInstaller.ROLE), new ArrayList<>());
         try {
+            guard.trust(installation);
             guard.activate();
             work.run(fixture);
         } finally {

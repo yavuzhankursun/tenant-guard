@@ -16,23 +16,23 @@
     <text x="40" y="130" fill="#ff7b72" font-weight="bold">LEAK</text>
     <text x="130" y="130">GET /invoices</text>
     <text x="320" y="130">200</text>
-    <text x="390" y="130">response changed after A's data was added: $.size, $[2].amount, ...</text>
-    <text x="390" y="148" fill="#8b949e">observer: invoice rows of tenant A read by select ... from invoice i1_0</text>
+    <text x="390" y="130">response changed after A's data was added: $.size</text>
+    <text x="390" y="148" fill="#8b949e">observer: invoice rows of tenant A read</text>
 
     <text x="40" y="176" fill="#ff7b72" font-weight="bold">LEAK</text>
     <text x="130" y="176">GET /invoices/{id}</text>
     <text x="320" y="176">200</text>
     <text x="390" y="176">200 for tenant A's /invoices/3</text>
-    <text x="390" y="194" fill="#8b949e">observer: invoice rows of tenant A read by select ... where i1_0.id=?</text>
+    <text x="390" y="194" fill="#8b949e">observer: invoice rows of tenant A read (by id)</text>
 
     <text x="40" y="222" fill="#ff7b72" font-weight="bold">LEAK</text>
     <text x="130" y="222">GET /reports/total</text>
     <text x="320" y="222">200</text>
     <text x="390" y="222">response changed after A's data was added: $.total</text>
-    <text x="390" y="240" fill="#8b949e">observer: invoice rows of tenant A read by select coalesce(sum(i1_0.amount),0) ...</text>
+    <text x="390" y="240" fill="#8b949e">observer: invoice rows of tenant A read by sum(amount)</text>
 
     <text x="40" y="270" fill="#3fb950">CLEAN</text>
     <text x="130" y="270">GET /my/invoices, GET /my/invoices/{id}</text>
-    <text x="500" y="270" fill="#8b949e">(2 not failing; full table: ScanReport.toString())</text>
+    <text x="500" y="270" fill="#8b949e">(2 not failing)</text>
   </g>
 </svg>

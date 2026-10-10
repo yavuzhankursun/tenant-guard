@@ -140,8 +140,8 @@ self-check'i çalıştırır ve sıfırlar. Her testten sonra guard'ı pasifleş
 `TenantGuardConfiguration`'ı (guard bean'i + `DataSource` sarmalayıcısı) meta-`@Import` ile
 getirir; Spring Boot'un test desteği bunu tanır.
 
-- Otomatik keşif, zaten RLS politikası olan tabloları ve tırnaklı/büyük-küçük harf karışık
-  isimleri atlar. Uyarı loglar ve `ObserverSetup.skippedTables()` içinde gerekçesiyle listeler.
+- Otomatik keşif, politikaları `tg_app`'e hiçbir şey vermeyen tabloları ve tırnaklı/büyük-küçük
+  harf karışık isimleri atlar. Uyarı loglar ve `ObserverSetup.skippedTables()` içinde gerekçesiyle listeler.
   Açıkça verilen `tables = {...}` ise hata verir. Gözlenecek hiç tablo yoksa test düşer.
 - Seed'i `@BeforeEach` içinde mi yapmak istiyorsunuz? Eklenti callback'leri `@BeforeEach`
   metotlarından *önce* çalışır; orada guard zaten kuruludur. `guard.deactivate()` deyin, seed
@@ -172,7 +172,8 @@ Her satır `src/test` altında bir testtir (`ObserverScenariosTest`, `Differenti
 | `JOIN invoice ... WHERE i.tenant_id = 'B'` ile filtrelenen alt tablo | `invoice_line` için `ACTOR_MISMATCH`: **yanlış alarm**, satırlar okundu ama join eledi |
 | `@Transactional(readOnly = true)` / rollback olan transaction | notice'ler korundu, bulgu üretildi |
 | superuser bağlantı | self-check FAIL (`superuser=true`) |
-| zaten RLS politikası olan tablo | açık kurulum reddedilir; otomatik keşif gerekçesiyle atlar |
+| kendi permissive RLS politikası olan tablo | gözlemci `AS RESTRICTIVE` kurulur; uygulamanın politikası filtrelemeye devam eder, elenen satırlar hiç gözlenmez |
+| politikaları `tg_app`'e hiçbir şey vermeyen tablo | reddedilir / gerekçesiyle atlanır: yalnızca restrictive politikalı tablo her satırı reddeder |
 | B olarak Hibernate `findAll()` | `ACTOR_MISMATCH` (A) |
 | B olarak `findById(A'nın id'si)` (aktif) | yakalandı |
 | aktörsüz `findById(A'nın id'si)` (pasif) | satır gözlendi, **bulgu yok** |
@@ -209,9 +210,11 @@ Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
   Hibernate `ddl-auto` desteklenmez. GRANT'ler `public` şemasını hedefler.
 - **Paralel test çalıştırma yok.** Aktör ve bulgular thread-local değil, süreç genelidir. Bu
   bilinçli bir karar: kiracı etiketi `@Async` ve thread pool'larda da hayatta kalır.
-- **Zaten RLS politikası olan tablolar desteklenmez.** Postgres permissive politikaları OR'lar;
-  uygulamanın kendi politikasının yanına her zaman true dönen bir gözlemci eklemek izolasyonu
-  kapatırdı. RESTRICTIVE gözlemci yol haritasında.
+- **Kendi RLS politikası olan tablolara RESTRICTIVE gözlemci kurulur.** Postgres permissive
+  politikaları OR'lar; her zaman true dönen permissive bir gözlemci uygulamanın izolasyonunu
+  kapatırdı. Restrictive gözlemci ise AND'lenir: uygulamanın politikası önce çalışır, elediği
+  satırlar hiç gözlenmez. Politikaları `tg_app`'e hiçbir şey vermeyen tablo reddedilir; yalnızca
+  restrictive politika "hepsini reddet" demektir ve gözlemci hiçbir şey göremezdi.
 - **Leakproof koşullar ve erken çıkışlar.** Politikadan önce text/bigint `=` ile elenen ya da hiç
   ulaşılmayan (`EXISTS`, `LIMIT`) satırlar gözlenmez.
 - **`tg|` NOTICE öneki taklit edilebilir:** uygulamanın kendi `RAISE NOTICE`'i aynı öneki
@@ -286,7 +289,6 @@ için çağrılar sıralıdır.
 ## Yol haritası
 
 - Üretilmiş gövdelerle POST/PUT/DELETE taraması; DELETE en sona, sonrasında yeniden seed.
-- Zaten RLS kullanan tablolar için RESTRICTIVE gözlemci politikası.
 - Yazma tarafının gözlenmesi (başka kiracıya `INSERT`/`UPDATE`).
 - Sabit `tg|` öneki yerine oturum başına NOTICE nonce'u.
 - `ALTER DEFAULT PRIVILEGES` ve `public` dışı şemalar.

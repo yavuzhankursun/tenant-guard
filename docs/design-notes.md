@@ -50,8 +50,10 @@ observed. No `FORCE ROW LEVEL SECURITY` for the same reason.
 
 Why refuse tables with existing policies: Postgres ORs permissive policies. An always-true
 observer next to the app's own policy would switch the app's isolation off in the test database
-and report leaks that do not exist. A RESTRICTIVE observer is the eventual answer; for now the
-installer refuses (`ObserverScenariosTest` 6) and auto-discovery skips with a reason.
+and report leaks that do not exist. On such tables the observer is created `AS RESTRICTIVE`, which
+Postgres ANDs with the permissive ones: the app's policy keeps filtering and rows it rejects are
+never observed (`ObserverScenariosTest` 6a). A table whose policies never grant `tg_app` anything
+is refused, because restrictive-only means deny-all and the observer would see nothing (6b).
 
 Why a self-check: if RLS silently does not apply (superuser, `BYPASSRLS`, `client_min_messages`
 above NOTICE, proxy not in the path), a leaky app produces zero findings, exactly like a clean

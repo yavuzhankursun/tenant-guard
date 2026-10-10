@@ -170,7 +170,8 @@ Each row is a test in `src/test` (`ObserverScenariosTest`, `DifferentialScenario
 | child table filtered through `JOIN invoice ... WHERE i.tenant_id = 'B'` | `ACTOR_MISMATCH` on `invoice_line`: **false positive**, rows read but discarded by the join |
 | `@Transactional(readOnly = true)` / transaction rolled back | notices kept, finding raised |
 | superuser connection | self-check fails (`superuser=true`) |
-| table with an existing RLS policy | explicit install refused; auto-discovery skips it with the reason |
+| table with its own permissive RLS policy | observer installed `AS RESTRICTIVE`; the app's policy still filters, rejected rows are never observed |
+| table whose policies never grant `tg_app` anything | refused / skipped with the reason: a restrictive-only table denies every row |
 | Hibernate `findAll()` as B | `ACTOR_MISMATCH` (A) |
 | `findById(A's id)` as B (active) | caught |
 | `findById(A's id)`, no actor (passive) | row observed, **no finding** |
@@ -207,9 +208,11 @@ Five silent under-reporting bugs were found by these tests and fixed:
   schema `public`.
 - **No parallel test execution.** The actor and the findings are process-wide, not thread-local.
   That's on purpose: the tenant label survives `@Async` and thread pools.
-- **Tables with existing RLS policies are unsupported.** Postgres ORs permissive policies, so an
-  always-true observer next to the app's own policy would switch its isolation off. A RESTRICTIVE
-  observer is on the roadmap.
+- **Tables with their own RLS policies get a RESTRICTIVE observer.** Postgres ORs permissive
+  policies, so a permissive always-true observer would switch the app's isolation off; a
+  restrictive one is AND-ed instead. The app's policy then runs first and rows it rejects are never
+  observed. A table whose policies never grant `tg_app` anything is refused: restrictive-only means
+  deny-all and the observer would see nothing.
 - **Leakproof predicates and early exits.** Rows rejected by `=` on text/bigint before the
   policy, or never reached (`EXISTS`, `LIMIT`), are not observed.
 - **The `tg|` NOTICE prefix is spoofable** by the application's own `RAISE NOTICE`.
@@ -282,7 +285,6 @@ Calls are sequential because the guard's actor is global.
 ## Roadmap
 
 - POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
-- RESTRICTIVE observer policy for tables that already use RLS.
 - Write-side observation (`INSERT`/`UPDATE` into another tenant).
 - Per-session NOTICE nonce instead of the fixed `tg|` prefix.
 - `ALTER DEFAULT PRIVILEGES` and non-`public` schemas.

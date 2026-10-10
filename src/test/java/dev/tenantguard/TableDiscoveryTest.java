@@ -17,12 +17,16 @@ class TableDiscoveryTest extends GuardedTestBase {
                 ddl.execute("CREATE VIEW invoice_view AS SELECT * FROM invoice");
                 ddl.execute("CREATE TABLE \"MixedCase\" (tenant_id text)");
                 ddl.execute("CREATE TABLE no_tenant (id int)");
+                ddl.execute("CREATE TABLE locked (tenant_id text)");
+                ddl.execute("ALTER TABLE locked ENABLE ROW LEVEL SECURITY");
+                ddl.execute("CREATE POLICY lock ON locked AS RESTRICTIVE USING (true)");
 
                 TableDiscovery.Result result = TableDiscovery.discover(owner, "tenant_id");
 
-                assertThat(result.tables()).containsExactly("invoice", "invoice_line");
-                assertThat(result.skipped()).containsOnlyKeys("MixedCase", "legacy_doc");
-                assertThat(result.skipped().get("legacy_doc")).contains("legacy_isolation");
+                // legacy_doc has its own permissive policy: observed with a RESTRICTIVE observer, not skipped.
+                assertThat(result.tables()).containsExactly("invoice", "invoice_line", "legacy_doc");
+                assertThat(result.skipped()).containsOnlyKeys("MixedCase", "locked");
+                assertThat(result.skipped().get("locked")).contains("none is permissive for role 'tg_app'");
                 assertThat(result.skipped().get("MixedCase")).contains("unsupported identifier");
             } finally {
                 owner.rollback();

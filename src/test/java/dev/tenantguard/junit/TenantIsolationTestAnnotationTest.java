@@ -71,12 +71,11 @@ class TenantIsolationTestAnnotationTest {
     }
 
     @Test
-    void autoDiscoveryObservesTenantTablesAndSkipsTablesWithForeignPolicies(ObserverSetup setup) {
+    void autoDiscoveryObservesEveryTenantTableIncludingOnesWithTheirOwnPolicy(ObserverSetup setup) {
         assertThat(setup.tenantColumn()).isEqualTo("tenant_id");
-        assertThat(setup.installedTables()).contains("invoice", "invoice_line")
-                .doesNotContain("legacy_doc", ObserverInstaller.PROBE_TABLE, "flyway_schema_history");
-        assertThat(setup.skippedTables()).containsOnlyKeys("legacy_doc");
-        assertThat(setup.skippedTables().get("legacy_doc")).contains("legacy_isolation");
+        assertThat(setup.installedTables()).contains("invoice", "invoice_line", "legacy_doc")
+                .doesNotContain(ObserverInstaller.PROBE_TABLE, "flyway_schema_history");
+        assertThat(setup.skippedTables()).isEmpty();
     }
 
     @Test

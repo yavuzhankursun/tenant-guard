@@ -6,15 +6,20 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Optional;
-import java.util.stream.Stream;
+import java.util.Map;
 
 /**
- * Installs the observer: a non-owner, non-bypass role and a permissive policy that always returns
- * true but raises a NOTICE for every row the executor reads. No FORCE ROW LEVEL SECURITY: the owner
+ * Installs the observer: a non-owner, non-bypass role and a policy that always returns true but
+ * raises a NOTICE for every row the executor reads. No FORCE ROW LEVEL SECURITY: the owner
  * (migrations, seeder) must bypass the observer, only the role the app switches into is watched.
  * Must run as the table owner or a superuser, after the schema exists.
+ *
+ * <p>On a table that already has its own permissive policy the observer is created
+ * {@code AS RESTRICTIVE}: Postgres ORs permissive policies, so a permissive always-true observer
+ * would switch the app's isolation off, while a restrictive one is AND-ed and leaves it intact.
+ * Rows the app's policy rejects are then never observed, which is right: they did not leak.
  */
 public final class ObserverInstaller {
 
@@ -28,7 +33,10 @@ public final class ObserverInstaller {
     public static void install(Connection owner, String tenantColumn, List<String> tables) throws SQLException {
         String column = Identifiers.require(tenantColumn);
         List<String> observed = tables.stream().map(Identifiers::require).toList();
-        refuseForeignPolicies(owner, observed);
+        Map<String, Boolean> restrictive = new LinkedHashMap<>();
+        for (String table : observed) {
+            restrictive.put(table, policyKind(owner, table) == PolicyKind.RESTRICTIVE);
+        }
 
         List<String> ddl = new ArrayList<>(List.of(
                 """
@@ -51,8 +59,8 @@ public final class ObserverInstaller {
                 "GRANT USAGE ON SCHEMA public TO " + ROLE,
                 "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO " + ROLE,
                 "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO " + ROLE));
-        Stream.concat(observed.stream(), Stream.of(PROBE_TABLE))
-                .forEach(table -> ddl.addAll(policyDdl(table, column)));
+        restrictive.forEach((table, asRestrictive) -> ddl.addAll(policyDdl(table, column, asRestrictive)));
+        ddl.addAll(policyDdl(PROBE_TABLE, column, false));
 
         try (Statement statement = owner.createStatement()) {
             for (String sql : ddl) {
@@ -61,39 +69,63 @@ public final class ObserverInstaller {
         }
     }
 
-    private static List<String> policyDdl(String table, String column) {
+    private static List<String> policyDdl(String table, String column, boolean restrictive) {
         return List.of(
                 "ALTER TABLE %s ENABLE ROW LEVEL SECURITY".formatted(table),
                 "DROP POLICY IF EXISTS %s ON %s".formatted(POLICY, table),
                 // WITH CHECK (true): the write side is out of MVP scope.
-                "CREATE POLICY %s ON %s FOR ALL TO %s USING (tg_observe('%s', %s::text)) WITH CHECK (true)"
-                        .formatted(POLICY, table, ROLE, table, column));
+                "CREATE POLICY %s ON %s AS %s FOR ALL TO %s USING (tg_observe('%s', %s::text)) WITH CHECK (true)"
+                        .formatted(POLICY, table, restrictive ? "RESTRICTIVE" : "PERMISSIVE", ROLE, table, column));
     }
 
+    /** How the observer must be created on {@code table} given the policies already on it. */
+    public enum PolicyKind { PERMISSIVE, RESTRICTIVE }
+
     /**
-     * Postgres ORs permissive policies, so adding an always-true one next to an existing policy would
-     * silently switch the app's own isolation off. RESTRICTIVE support is post-MVP; refuse for now.
+     * No foreign policy: permissive. A foreign permissive policy that applies to the observed role:
+     * restrictive, so it is AND-ed. Foreign policies that never grant the role anything: refused,
+     * because a restrictive-only table denies every row and the observer would see nothing.
      */
-    private static void refuseForeignPolicies(Connection owner, List<String> tables) throws SQLException {
-        for (String table : tables) {
-            Optional<String> policy = foreignPolicy(owner, table);
-            if (policy.isPresent()) {
-                throw new IllegalStateException(("Table '%s' already has RLS policy '%s'. TenantGuard "
-                        + "does not support tables with existing policies yet.").formatted(table, policy.get()));
-            }
+    public static PolicyKind policyKind(Connection owner, String table) throws SQLException {
+        List<ForeignPolicy> foreign = foreignPolicies(owner, table);
+        if (foreign.isEmpty()) {
+            return PolicyKind.PERMISSIVE;
+        }
+        if (foreign.stream().anyMatch(ForeignPolicy::grantsObservedRole)) {
+            return PolicyKind.RESTRICTIVE;
+        }
+        throw new IllegalStateException(("Table '%s' has RLS policies (%s) but none is permissive for role '%s'; "
+                + "the observer would see nothing. Add a permissive policy for %s or exclude the table.")
+                .formatted(table, foreign.stream().map(ForeignPolicy::name).toList(), ROLE, ROLE));
+    }
+
+    /** Names of the RLS policies on {@code table} that are not the observer, in name order. */
+    static List<String> foreignPolicyNames(Connection owner, String table) throws SQLException {
+        return foreignPolicies(owner, table).stream().map(ForeignPolicy::name).toList();
+    }
+
+    private record ForeignPolicy(String name, boolean permissive, List<String> roles) {
+
+        boolean grantsObservedRole() {
+            return permissive && (roles.contains("public") || roles.contains(ROLE));
         }
     }
 
-    /** The first RLS policy on {@code table} that is not the observer, if any. */
-    static Optional<String> foreignPolicy(Connection owner, String table) throws SQLException {
-        String sql = "SELECT policyname FROM pg_policies "
+    private static List<ForeignPolicy> foreignPolicies(Connection owner, String table) throws SQLException {
+        String sql = "SELECT policyname, permissive, roles::text[] FROM pg_policies "
                 + "WHERE schemaname = current_schema() AND tablename = ? AND policyname <> ? ORDER BY policyname";
+        List<ForeignPolicy> policies = new ArrayList<>();
         try (PreparedStatement statement = owner.prepareStatement(sql)) {
             statement.setString(1, table);
             statement.setString(2, POLICY);
             try (ResultSet rs = statement.executeQuery()) {
-                return rs.next() ? Optional.of(rs.getString(1)) : Optional.empty();
+                while (rs.next()) {
+                    String[] roles = (String[]) rs.getArray(3).getArray();
+                    policies.add(new ForeignPolicy(rs.getString(1), "PERMISSIVE".equals(rs.getString(2)),
+                            List.of(roles)));
+                }
             }
         }
+        return policies;
     }
 }

@@ -79,6 +79,36 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Pool matrix (PoolMatrixTest, -Dtenantguard.pool=...): every pool wraps JDBC objects differently.
+             Boot's BOM manages tomcat-jdbc, dbcp2 and caffeine; c3p0 and vibur are pinned. -->
+        <dependency>
+            <groupId>org.apache.tomcat</groupId>
+            <artifactId>tomcat-jdbc</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-dbcp2</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.mchange</groupId>
+            <artifactId>c3p0</artifactId>
+            <version>0.14.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.vibur</groupId>
+            <artifactId>vibur-dbcp</artifactId>
+            <version>26.0</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- vibur's statement cache needs Caffeine (an optional dependency of vibur-dbcp). -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>

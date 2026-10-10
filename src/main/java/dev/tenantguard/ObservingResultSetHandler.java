@@ -54,9 +54,7 @@ final class ObservingResultSetHandler implements InvocationHandler {
                 return call(method, args);
             }
             case "close" -> {
-                if (!target.isClosed()) {
-                    harvest();
-                }
+                harvestBeforeClose();
                 return call(method, args);
             }
             default -> {
@@ -66,6 +64,21 @@ final class ObservingResultSetHandler implements InvocationHandler {
                 }
                 return result;
             }
+        }
+    }
+
+    /**
+     * Re-executing the statement closes this result in the driver, yet c3p0's wrapper still reports
+     * {@code isClosed() == false} and then throws from getWarnings. Its rows were harvested on
+     * navigation, so an unreadable chain at close loses nothing; failing the app's close would.
+     */
+    private void harvestBeforeClose() {
+        try {
+            if (!target.isClosed()) {
+                harvest();
+            }
+        } catch (SQLException e) {
+            // Closed underneath us; see above.
         }
     }
 

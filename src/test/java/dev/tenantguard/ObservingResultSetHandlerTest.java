@@ -25,7 +25,7 @@ class ObservingResultSetHandlerTest {
     interface DriverResultSet extends ResultSet {
     }
 
-    private final TenantGuard guard = new TenantGuard();
+    private final TenantGuard guard = WarningChain.trustingGuard();
     private final WarningChain chain = new WarningChain();
     private final DriverResultSet driver = mock(DriverResultSet.class);
     private final Statement owner = mock(Statement.class);

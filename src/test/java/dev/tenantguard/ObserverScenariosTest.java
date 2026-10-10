@@ -105,7 +105,7 @@ class ObserverScenariosTest extends GuardedTestBase {
             sql.execute("TRUNCATE legacy_doc");
             sql.execute("INSERT INTO legacy_doc (tenant_id, title) VALUES ('A', 'a-doc'), ('B', 'b-doc')");
             assertThat(ObserverInstaller.policyKind(owner, "legacy_doc")).isEqualTo(ObserverInstaller.PolicyKind.RESTRICTIVE);
-            ObserverInstaller.install(owner, "tenant_id", List.of("legacy_doc"));
+            guard.trust(ObserverInstaller.install(owner, "tenant_id", List.of("legacy_doc")));
         }
         guard.reset();
 

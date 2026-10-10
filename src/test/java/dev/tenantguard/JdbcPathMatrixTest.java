@@ -138,19 +138,23 @@ class JdbcPathMatrixTest extends GuardedTestBase {
     @DisplayName("Postgres: kendi kolonunu okuyan UPDATE politikayı satır başına iki kez çalıştırır (eski satır + yeni satır)")
     void updateReadingItsOwnColumnRunsThePolicyTwicePerRow() throws SQLException {
         // SET number = number needs SELECT rights, so the SELECT policy is also checked on the new row.
-        assertThat(rawNoticeCount(TOUCH_ALL)).isEqualTo(8);
-        assertThat(rawNoticeCount("UPDATE invoice SET amount = 0")).isEqualTo(4);
+        assertThat(rawNoticeCount(TOUCH_ALL, RowRead.Kind.READ)).isEqualTo(8);
+        assertThat(rawNoticeCount("UPDATE invoice SET amount = 0", RowRead.Kind.READ)).isEqualTo(4);
+        // WITH CHECK runs once per new row, whether or not the statement reads its own columns.
+        assertThat(rawNoticeCount(TOUCH_ALL, RowRead.Kind.WRITE)).isEqualTo(4);
+        assertThat(rawNoticeCount("UPDATE invoice SET amount = 0", RowRead.Kind.WRITE)).isEqualTo(4);
     }
 
     /** Bypasses the guard entirely: what the server really sends, as the observed role. */
-    private static int rawNoticeCount(String sql) throws SQLException {
+    private static int rawNoticeCount(String sql, RowRead.Kind kind) throws SQLException {
         try (Connection owner = ownerConnection(); Statement s = owner.createStatement()) {
             owner.setAutoCommit(false);
             s.execute("SET LOCAL ROLE " + ObserverInstaller.ROLE);
             s.execute(sql);
             int notices = 0;
             for (SQLWarning w = s.getWarnings(); w != null; w = w.getNextWarning()) {
-                notices += RowRead.parse(w).isPresent() ? 1 : 0;
+                // Any nonce: this raw connection bypasses the guard that knows the install's nonce.
+                notices += RowRead.parse(w, nonce -> true).filter(row -> row.kind() == kind).isPresent() ? 1 : 0;
             }
             owner.rollback();
             return notices;

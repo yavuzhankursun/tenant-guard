@@ -14,6 +14,8 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -111,6 +113,8 @@ class CorpusMechanismTest extends CorpusTestBase {
         return DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
     }
 
+    private static final Pattern CORPUS_READ = Pattern.compile("tg:[0-9a-f]{32}\\|r\\|corpus_invoice\\|(.*)");
+
     private static void asObservedRole(Statement sql) throws SQLException {
         sql.execute("SET ROLE " + ObserverInstaller.ROLE);
         sql.execute("SET client_min_messages = notice");
@@ -125,9 +129,10 @@ class CorpusMechanismTest extends CorpusTestBase {
         }
         List<String> tenants = new ArrayList<>();
         for (SQLWarning w = sql.getWarnings(); w != null; w = w.getNextWarning()) {
-            String message = w.getMessage();
-            if (message != null && message.startsWith("tg|corpus_invoice|")) {
-                tenants.add(message.substring("tg|corpus_invoice|".length()).strip());
+            // Any nonce: this raw connection bypasses the guard that knows the install's nonce.
+            Matcher read = CORPUS_READ.matcher(String.valueOf(w.getMessage()));
+            if (read.matches()) {
+                tenants.add(read.group(1).strip());
             }
         }
         sql.clearWarnings();

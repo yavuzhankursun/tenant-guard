@@ -125,12 +125,16 @@ final class ObservedDataSources {
         return warnings;
     }
 
-    /** Installs through every target; the tables are the union, in first-seen order. */
-    TableDiscovery.Result install(String column, String[] tables, String[] schemas) {
+    /**
+     * Installs through every target; the tables are the union, in first-seen order. {@code guard}
+     * trusts each target's nonce, so every observed database's notices count.
+     */
+    TableDiscovery.Result install(TenantGuard guard, String column, String[] tables, String[] schemas) {
         Set<String> installed = new LinkedHashSet<>();
         Map<String, String> skipped = new TreeMap<>();
         for (Target target : targets) {
-            TableDiscovery.Result result = through(target, () -> TenantGuardExtension.install(target.dataSource(), column, tables, schemas));
+            TableDiscovery.Result result = through(target,
+                    () -> TenantGuardExtension.install(target.dataSource(), guard, column, tables, schemas));
             installed.addAll(result.tables());
             skipped.putAll(result.skipped());
         }

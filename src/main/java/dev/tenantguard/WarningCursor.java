@@ -3,6 +3,7 @@ package dev.tenantguard;
 import java.sql.SQLWarning;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Predicate;
 
 /**
  * JDBC warning chains only grow until cleared. Remembers how far a chain was read so each observer
@@ -15,7 +16,8 @@ final class WarningCursor {
     private SQLWarning head;
     private int consumed;
 
-    List<RowRead> drain(SQLWarning current) {
+    /** @param trusted the nonces whose notices are observations; see {@link RowRead#parse} */
+    List<RowRead> drain(SQLWarning current, Predicate<String> trusted) {
         if (current != head) {
             head = current;
             consumed = 0;
@@ -24,7 +26,7 @@ final class WarningCursor {
         int index = 0;
         for (SQLWarning w = current; w != null; w = w.getNextWarning(), index++) {
             if (index >= consumed) {
-                RowRead.parse(w).ifPresent(rows::add);
+                RowRead.parse(w, trusted).ifPresent(rows::add);
             }
         }
         consumed = index;

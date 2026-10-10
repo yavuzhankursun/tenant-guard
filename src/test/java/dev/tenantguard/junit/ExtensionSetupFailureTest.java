@@ -98,8 +98,8 @@ class ExtensionSetupFailureTest {
                     END $$""");
         }
 
-        assertThatThrownBy(() -> TenantGuardExtension.install(connectingAs("tg_stranger", "stranger"), "tenant_id",
-                new String[] {"invoice"}))
+        assertThatThrownBy(() -> TenantGuardExtension.install(connectingAs("tg_stranger", "stranger"), new TenantGuard(),
+                "tenant_id", new String[] {"invoice"}))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("could not install the observer as user 'tg_stranger'")
                 .hasMessageContaining("42501")

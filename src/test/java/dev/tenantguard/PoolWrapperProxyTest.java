@@ -26,7 +26,7 @@ class PoolWrapperProxyTest {
     private static final RowRead B = new RowRead("invoice", "B");
     private static final String SQL = "SELECT * FROM invoice WHERE tenant_id = ?";
 
-    private final TenantGuard guard = new TenantGuard();
+    private final TenantGuard guard = WarningChain.trustingGuard();
     private final WarningChain chain = new WarningChain();
     private final Connection driverConnection = mock(Connection.class);
     private final Connection connection = ObservingConnectionHandler.wrap(driverConnection, guard);

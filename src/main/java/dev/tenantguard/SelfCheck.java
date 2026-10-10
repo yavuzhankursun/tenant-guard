@@ -46,7 +46,8 @@ public final class SelfCheck {
                 .anyMatch(o -> o.tenantsByTable().containsKey(ObserverInstaller.PROBE_TABLE));
         if (!observed) {
             throw new IllegalStateException("TenantGuard is blind: probe query produced no observer notice "
-                    + "(policy missing, or client_min_messages filters NOTICE)");
+                    + "(policy missing, client_min_messages filters NOTICE, or the guard does not trust this "
+                    + "install's nonce: pass what ObserverInstaller.install returns to TenantGuard.trust)");
         }
     }
 

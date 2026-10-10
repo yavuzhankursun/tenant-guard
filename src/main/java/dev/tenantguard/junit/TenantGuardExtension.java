@@ -65,7 +65,7 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                 seeder.seed(settings.victim());
                 seeder.seed(settings.attacker());
             });
-            TableDiscovery.Result tables = dataSources.install(settings.tenantColumn(), settings.tables(),
+            TableDiscovery.Result tables = dataSources.install(guard, settings.tenantColumn(), settings.tables(),
                     settings.schemas());
             guard.activate();
             if (settings.selfCheck()) {
@@ -122,14 +122,17 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
     /**
      * The guard is inactive here, so the guarded DataSource runs {@code RESET ROLE}: the connection
      * uses the app's own credentials, which own the tables when the schema comes from Flyway.
+     * {@code guard} trusts the new install's nonce once it is committed, and not before: a failed
+     * commit leaves the old function, and so the old nonce, in place.
      */
-    static TableDiscovery.Result install(DataSource dataSource, String column, String[] explicitTables) {
-        return install(dataSource, column, explicitTables, new String[0]);
+    static TableDiscovery.Result install(DataSource dataSource, TenantGuard guard, String column,
+                                         String[] explicitTables) {
+        return install(dataSource, guard, column, explicitTables, new String[0]);
     }
 
     /** @param schemas where discovery looks, empty for the connection's search_path; unused for explicit tables */
-    static TableDiscovery.Result install(DataSource dataSource, String column, String[] explicitTables,
-                                         String[] schemas) {
+    static TableDiscovery.Result install(DataSource dataSource, TenantGuard guard, String column,
+                                         String[] explicitTables, String[] schemas) {
         try (Connection owner = dataSource.getConnection()) {
             TableDiscovery.Result tables = explicitTables.length > 0
                     ? new TableDiscovery.Result(List.of(explicitTables), Map.of())
@@ -143,7 +146,7 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                         + "schema-per-tenant designs without one (Hibernate schema multi-tenancy, a schema or database "
                         + "per tenant) are out of scope.").formatted(where, column, tables.skipped()));
             }
-            installAs(owner, column, tables.tables());
+            guard.trust(installAs(owner, column, tables.tables()));
             return tables;
         } catch (SQLException e) {
             throw new IllegalStateException(("TenantGuard could not read the schema through the app's DataSource "
@@ -152,12 +155,14 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
         }
     }
 
-    private static void installAs(Connection owner, String column, List<String> tables) throws SQLException {
+    private static ObserverInstaller.Installation installAs(Connection owner, String column, List<String> tables)
+            throws SQLException {
         try {
-            ObserverInstaller.install(owner, column, tables);
+            ObserverInstaller.Installation installation = ObserverInstaller.install(owner, column, tables);
             if (!owner.getAutoCommit()) {
                 owner.commit();
             }
+            return installation;
         } catch (SQLException e) {
             String user = owner.getMetaData().getUserName();
             String hint = INSUFFICIENT_PRIVILEGE.equals(e.getSQLState())

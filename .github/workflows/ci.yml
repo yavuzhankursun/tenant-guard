@@ -4,10 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly environment matrix: catches new patch releases and image updates without a push.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mutation:
+        description: Run PIT mutation testing (-Pmutation)
+        type: boolean
+        default: true
+      matrix:
+        description: Run the environment matrix
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    # ubuntu runners ship with Docker, which Testcontainers needs for Postgres 16.
+    # Fast default build: Boot 3.5.11, pgjdbc from the Boot BOM, Hikari, Postgres 16.
+    # ubuntu runners ship with Docker, which Testcontainers needs.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,3 +40,103 @@ jobs:
         with:
           name: surefire-reports
           path: target/surefire-reports
+
+  matrix:
+    # One dimension at a time against the default build, not a cross product. An empty value means
+    # the default (Boot 3.5.11, the Boot-managed pgjdbc, Hikari); every entry names its Postgres.
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && inputs.matrix)
+    name: matrix (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: pg13, pg: '13' }
+          - { name: pg14, pg: '14' }
+          - { name: pg15, pg: '15' }
+          - { name: pg16, pg: '16' }
+          - { name: pg17, pg: '17' }
+          - { name: boot-3.2, pg: '16', boot: 3.2.12 }
+          - { name: boot-3.3, pg: '16', boot: 3.3.13 }
+          - { name: boot-3.4, pg: '16', boot: 3.4.13 }
+          - { name: boot-3.5, pg: '16', boot: 3.5.16 }
+          - { name: pgjdbc-42.6.2, pg: '16', pgjdbc: 42.6.2 }
+          - { name: pgjdbc-42.7.10, pg: '16', pgjdbc: 42.7.10 }
+          - { name: pool-tomcat, pg: '16', pool: tomcat }
+          - { name: pool-dbcp2, pg: '16', pool: dbcp2 }
+          - { name: pool-c3p0, pg: '16', pool: c3p0 }
+          - { name: pool-none, pg: '16', pool: none }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Test
+        env:
+          PG: ${{ matrix.pg }}
+          BOOT: ${{ matrix.boot }}
+          PGJDBC: ${{ matrix.pgjdbc }}
+          POOL: ${{ matrix.pool }}
+        run: |
+          set -o pipefail
+          args=("-Dtenantguard.pg.image=postgres:${PG}-alpine")
+          if [ -n "$BOOT" ]; then args+=("-Dboot.version=$BOOT"); fi
+          if [ -n "$PGJDBC" ]; then args+=("-Dpostgresql.version=$PGJDBC"); fi
+          if [ -n "$POOL" ]; then args+=("-Dtenantguard.pool=$POOL"); fi
+          echo "mvn -B verify ${args[*]}" | tee "$RUNNER_TEMP/command.txt"
+          mvn -B --no-transfer-progress "${args[@]}" verify | tee "$RUNNER_TEMP/mvn.log"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo '```'
+            cat "$RUNNER_TEMP/command.txt" 2>/dev/null || true
+            grep -E 'Tests run:' "$RUNNER_TEMP/mvn.log" 2>/dev/null | sed 's/^\[[A-Z]*\] //' || echo 'no test output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: surefire-reports-${{ matrix.name }}
+          path: target/surefire-reports
+          if-no-files-found: ignore
+
+  mutation:
+    # Manual only: each PIT minion starts its own Postgres container and Spring context.
+    if: github.event_name == 'workflow_dispatch' && inputs.mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: PIT
+        run: |
+          set -o pipefail
+          mvn -B --no-transfer-progress -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage \
+            | tee "$RUNNER_TEMP/pit.log"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### PIT (mutation profile)'
+            echo '```'
+            grep -E '>> (Generated|Ran|Line Coverage)' "$RUNNER_TEMP/pit.log" 2>/dev/null || echo 'no PIT output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pit-reports
+          path: target/pit-reports
+          if-no-files-found: ignore

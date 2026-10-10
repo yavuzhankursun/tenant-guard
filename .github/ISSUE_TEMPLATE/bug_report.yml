@@ -1,0 +1,30 @@
+name: Bug report
+description: A leak tenant-guard did not report, a false finding, or a setup failure
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: For a missed or false finding, the SQL (or repository method) and the tenants involved.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Ideally a minimal schema, seeder and @TenantIsolationTest.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: tenant-guard, Java, Spring Boot, PostgreSQL, pgjdbc, connection pool
+      placeholder: tenant-guard 0.2.0, Java 21, Boot 3.5.11, Postgres 16, pgjdbc 42.7.10, HikariCP
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Findings, ObserverSetup.warnings()/skippedTables(), or the setup error. Remove any real data.
+      render: text

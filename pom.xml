@@ -4,9 +4,11 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>dev.tenantguard</groupId>
+    <!-- Maven Central namespace verified through the GitHub account (io.github.<user>). The Java
+         packages stay dev.tenantguard: Central does not tie package names to the groupId. -->
+    <groupId>io.github.yavuzhankursun</groupId>
     <artifactId>tenant-guard</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.2.0-SNAPSHOT</version>
     <name>tenant-guard</name>
     <description>Detects cross-tenant data leaks in Spring/JDBC tests from inside PostgreSQL via an RLS observer policy.</description>
     <url>https://github.com/yavuzhankursun/tenant-guard</url>
@@ -18,10 +20,25 @@
         </license>
     </licenses>
 
+    <developers>
+        <developer>
+            <id>yavuzhankursun</id>
+            <name>Yavuzhan Kurşun</name>
+            <url>https://github.com/yavuzhankursun</url>
+        </developer>
+    </developers>
+
     <scm>
         <url>https://github.com/yavuzhankursun/tenant-guard</url>
         <connection>scm:git:https://github.com/yavuzhankursun/tenant-guard.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/yavuzhankursun/tenant-guard.git</developerConnection>
+        <tag>HEAD</tag>
     </scm>
+
+    <issueManagement>
+        <system>GitHub Issues</system>
+        <url>https://github.com/yavuzhankursun/tenant-guard/issues</url>
+    </issueManagement>
 
     <!-- No spring-boot-starter-parent: a parent's version cannot be a property, and this library must
          be testable against several Boot lines (mvn -Dboot.version=3.2.12 test). The Boot BOM is
@@ -49,6 +66,11 @@
         <maven-jar-plugin.version>3.5.1</maven-jar-plugin.version>
         <maven-install-plugin.version>3.2.0</maven-install-plugin.version>
         <maven-deploy-plugin.version>3.1.4</maven-deploy-plugin.version>
+        <!-- release profile -->
+        <maven-source-plugin.version>3.4.0</maven-source-plugin.version>
+        <maven-javadoc-plugin.version>3.12.0</maven-javadoc-plugin.version>
+        <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
+        <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -285,6 +307,91 @@
                     </dependency>
                 </dependencies>
             </dependencyManagement>
+        </profile>
+
+        <!-- Maven Central release: sources + javadoc jars, GPG signatures, upload to the Central Portal.
+             Local dry run (no key needed): mvn -Prelease -Dgpg.skip -DskipTests package
+             CI (.github/workflows/release.yml): mvn -Prelease -DskipTests deploy, with the key imported
+             into gpg, MAVEN_GPG_PASSPHRASE set and server "central" in settings.xml. autoPublish is
+             off: the deployment waits in https://central.sonatype.com/publishing/deployments until it
+             is published (or dropped) by hand. -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>${maven-source-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>${maven-javadoc-plugin.version}</version>
+                        <configuration>
+                            <!-- Every doclint group except "missing" (undocumented parameters, returns
+                                 and record components: ~100 today), and any warning fails the release,
+                                 so broken HTML, dangling {@link}s and bad syntax never reach Central. -->
+                            <doclint>all,-missing</doclint>
+                            <failOnWarnings>true</failOnWarnings>
+                            <quiet>true</quiet>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>${maven-gpg-plugin.version}</version>
+                        <configuration>
+                            <!-- Default signer "gpg": signs with the default (or -Dgpg.keyname) key of
+                                 the imported keyring. The passphrase comes from the MAVEN_GPG_PASSPHRASE
+                                 environment variable; loopback lets gpg take it without a TTY. -->
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>${central-publishing-maven-plugin.version}</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>false</autoPublish>
+                            <!-- Fail the build if Central rejects the bundle (missing signature,
+                                 javadoc, POM metadata), instead of only uploading it. -->
+                            <waitUntil>validated</waitUntil>
+                            <deploymentName>${project.artifactId} ${project.version}</deploymentName>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
 
         <!-- Mutation testing of the JDBC core: mvn -B -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage

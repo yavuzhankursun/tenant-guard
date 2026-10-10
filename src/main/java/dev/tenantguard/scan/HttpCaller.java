@@ -4,12 +4,16 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
+import org.springframework.web.bind.annotation.RequestMethod;
 
 /**
- * One GET through MockMvc. Never throws: MockMvc rethrows handler exceptions instead of rendering a
+ * One request through MockMvc. Never throws: MockMvc rethrows handler exceptions instead of rendering a
  * 500, and one crashing endpoint must not abort the scan (or the differential probe mid-baseline).
  */
 final class HttpCaller {
@@ -40,9 +44,22 @@ final class HttpCaller {
 
     /** {@code path} must already be encoded; the URI overload stops MockMvc from encoding it twice. */
     Response get(String path, String tenant) {
+        return perform(MockMvcRequestBuilders.get(URI.create(path)), tenant);
+    }
+
+    /** {@code json} null sends no body; otherwise it goes as {@code application/json}. */
+    Response send(RequestMethod method, String path, String json, String tenant) {
+        MockHttpServletRequestBuilder request = MockMvcRequestBuilders.request(HttpMethod.valueOf(method.name()), URI.create(path));
+        if (json != null) {
+            request.contentType(MediaType.APPLICATION_JSON).content(json);
+        }
+        return perform(request, tenant);
+    }
+
+    private Response perform(MockHttpServletRequestBuilder request, String tenant) {
         try {
             MockHttpServletResponse response = mockMvc
-                    .perform(MockMvcRequestBuilders.get(URI.create(path)).with(authenticator.forTenant(tenant)))
+                    .perform(request.with(authenticator.forTenant(tenant)))
                     .andReturn()
                     .getResponse();
             return new Response(response.getStatus(), parse(response.getContentAsString(StandardCharsets.UTF_8)), null);

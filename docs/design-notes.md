@@ -163,7 +163,35 @@ chains and a few Postgres-backed blindness tests, 96% are killed and the remaini
 equivalent mutants. The point is the same as the self-check's: a harvest that silently stops
 working must turn something red.
 
-## 11. Things deliberately kept simple
+## 11. What the environment matrix found
+
+Five dimensions, one agent each, every cell run locally before it went into CI:
+
+- **Postgres 13–17 and pgjdbc 42.6/42.7:** no core change. `security_invoker` views exist from
+  PG 15 only (the corpus row is version-gated). pgjdbc 42.7.14 attaches cursor-fetch notices one by
+  one instead of per batch; same chain by the time `next()` returns. `PgjdbcContractTest` pins the
+  three driver behaviours the observer depends on.
+- **Spring Boot 3.2–3.5:** no code change; only the build needed work (Testcontainers pin for
+  Docker 29, Flyway 10 for Boot < 3.3). Minimum supported Boot is 3.2.
+- **Connection pools:** three real observer gaps, all in the "silent under-reporting or
+  misattribution" class. A pool statement cache hands the next borrower the previous warning chain
+  (double count, and A's own read charged to B); DBCP2's result wrapper unwraps to itself (two
+  proxies per result); c3p0 reports a driver-closed result as open but throws on `getWarnings`.
+  The statement proxy now skips leftovers at construction, there is one result proxy per current
+  statement result, and the close-time harvest tolerates a closed result.
+- **Tenant column shapes and schemas:** grants were hard-coded to `public`, discovery looked only
+  at `current_schema()`, the same table name in two schemas could not be told apart, and the probe
+  policy read the tenant column (a `company_id` install broke a later `tenant_id` one). Identifiers
+  are now quoted from an allowlist that excludes the double quote, so mixed case and reserved
+  words work. The actor is compared with `tenant_column::text` exactly; no numeric normalization,
+  because `"02"` and `"2"` are different text tenants and a wrong actor should fail loudly.
+- **App wiring:** the guard must sit directly on the pool, under Spring's
+  `LazyConnectionDataSourceProxy` and `TransactionAwareDataSourceProxy`; above the latter, raw
+  connections silently leave the transaction. The lazy proxy's read-only replica was a blind path
+  and is guarded now. Routing DataSources are installed and self-checked per target; unlisted
+  DataSources are switched off with a warning rather than observed-but-never-installed.
+
+## 12. Things deliberately kept simple
 
 - The actor is a global, not a `ThreadLocal`: the scanner issues one request at a time, and a
   global survives `@Async` and thread pools. Cost: no parallel test execution.

@@ -100,7 +100,7 @@ seed edin. O zaman `MAX`, `MIN` ve `ORDER BY ... LIMIT 1` A sızar sızmaz deği
 
 ```java
 @SpringBootTest
-@TenantIsolationTest(tenantColumn = "tenant_id")   // tablolar: şemada bu kolona sahip her tablo
+@TenantIsolationTest(tenantColumn = "tenant_id")   // tablolar: search_path üzerinde bu kolona sahip her tablo
 class TenantIsolationIT {
 
     @TestConfiguration
@@ -142,9 +142,22 @@ self-check'i çalıştırır ve sıfırlar. Her testten sonra guard'ı pasifleş
 `TenantGuardConfiguration`'ı (guard bean'i + `DataSource` sarmalayıcısı) meta-`@Import` ile
 getirir; Spring Boot'un test desteği bunu tanır.
 
-- Otomatik keşif, politikaları `tg_app`'e hiçbir şey vermeyen tabloları ve tırnaklı/büyük-küçük
-  harf karışık isimleri atlar. Uyarı loglar ve `ObserverSetup.skippedTables()` içinde gerekçesiyle listeler.
-  Açıkça verilen `tables = {...}` ise hata verir. Gözlenecek hiç tablo yoksa test düşer.
+- Otomatik keşif, uygulama bağlantısının `search_path`'indeki her şemayı ya da `schemas = {...}`
+  ile verilenleri tarar. Büyük-küçük harf karışık adlar ve reserved word'ler tırnaklanıp gözlenir;
+  tırnak, `|`, `.`, boşluk ya da kontrol karakteri içeren adlar ve politikaları `tg_app`'e hiçbir
+  şey vermeyen tablolar `ObserverSetup.skippedTables()` içinde gerekçesiyle atlanır. Açıkça verilen
+  `tables = {...}` (`tablo` ya da `şema.tablo`) ise hata verir. Gözlenecek hiç tablo yoksa test düşer.
+- Aktör, kolonun tipi ne olursa olsun (`integer`, `bigint`, `uuid`, `text`, `company_id`...)
+  `tenant_kolonu::text` ile birebir karşılaştırılır: `String.valueOf(id)` ya da `UUID.toString()`
+  geçin. Sayısal normalizasyon bilerek yok: `"02"` ile `"2"` farklı text kiracılardır ve yanlış
+  biçimlenmiş bir aktör rastgele eşleşmek yerine yüksek sesle hata verir.
+- Birden fazla `DataSource` bean'i mi var? `@Primary` olan gözlenir; diğerleri kapatılır ve
+  `ObserverSetup.warnings()` içinde listelenir. `@TenantIsolationTest(dataSources = {"dataSource",
+  "reporting"})` ile fazlasını gözleyin; `AbstractRoutingDataSource` her hedefinde kurulup
+  self-check edilir. Guard doğrudan havuzun üstüne, `LazyConnectionDataSourceProxy` /
+  `TransactionAwareDataSourceProxy`'nin altına konur (transaction-aware proxy'nin üstündeki bir guard
+  ham bağlantıların transaction'dan kaçmasına yol açar); lazy proxy'nin read-only replikası da
+  gözlenir.
 - Seed'i `@BeforeEach` içinde mi yapmak istiyorsunuz? Eklenti callback'leri `@BeforeEach`
   metotlarından *önce* çalışır; orada guard zaten kuruludur. `guard.deactivate()` deyin, seed
   edin, sonra `guard.activate(); guard.reset()`.
@@ -227,9 +240,9 @@ Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
    kimse gözlemiyordu. Düzeltme: istenen tip bir JDBC arayüzüyse proxy'yi döndür.
 4. Sürücü zinciri bizim görmediğimiz bir yerde temizleyince okuma imleci bayatlıyor, yeni
    notice'ler atlanıyordu. Düzeltme: zincirin baş nesnesi değişince sıfırdan say.
-5. Hikari `executeQuery` ve `getResultSet` için ayrı wrapper üretince aynı sürücü `ResultSet`'i
-   iki kez sarılıyor ve fetch notice'leri çift sayılıyordu. Düzeltme: sürücü `ResultSet`'i
-   başına tek proxy.
+5. Havuzlar `executeQuery` ve `getResultSet` için ayrı wrapper üretince aynı sonuç iki kez
+   sarılıyor ve fetch notice'leri çift sayılıyordu. Düzeltme: statement'ın o anki sonucu başına
+   tek proxy.
 
 ## Varsayımlar ve sınırlar
 
@@ -237,7 +250,9 @@ Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
 - **Şemanın sahibi uygulama kullanıcısı.** Gözlemci, guard pasifken sarmalanmış `DataSource`
   üzerinden, yani uygulamanın kendi kimlik bilgileriyle kurulur. Bu kullanıcı tabloların sahibi
   olmalıdır (Flyway ya da uygulama kullanıcısıyla çalışan migration'lar); sahibi olmayan bir rolle
-  Hibernate `ddl-auto` desteklenmez. GRANT'ler `public` şemasını hedefler.
+  Hibernate `ddl-auto` desteklenmez. `tg_app`'e `search_path`'teki her şema ve gözlenen tablo
+  içeren her şema verilir. Tenant kolonu olmayan şema-başına-kiracı tasarımları (Hibernate `SCHEMA`
+  multitenancy) kapsam dışıdır ve bunu söyleyen bir mesajla düşer.
 - **Paralel test çalıştırma yok.** Aktör ve bulgular thread-local değil, süreç genelidir. Bu
   bilinçli bir karar: kiracı etiketi `@Async` ve thread pool'larda da hayatta kalır.
 - **Kendi RLS politikası olan tablolara RESTRICTIVE gözlemci kurulur.** Postgres permissive
@@ -335,30 +350,59 @@ için çağrılar sıralıdır.
 
 ## Nasıl doğrulanıyor
 
-- Her push'ta Testcontainers Postgres 16 üzerinde **231 test** (GitHub Actions).
+- Her push'ta Testcontainers Postgres üzerinde **503 test** (GitHub Actions); aşağıdaki ortam
+  matrisi `main`'e her push'ta ve her gece.
 - **33 yollu JDBC erişim matrisi** (`JdbcPathMatrixTest`): aynı sızıntı Statement,
   PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate ve `unwrap` yollarının her
   birinden.
 - **33 kalıplık sızıntı korpusu** (yukarıda), her kör nokta için mekanizma testi.
 - **Mutasyon testi** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, JDBC çekirdeğinde
-  PIT STRONGER mutator'ları): 227 mutantın %96'sı öldürüldü; kalan 8'i eşdeğer mutant (void dönüş,
+  PIT STRONGER mutator'ları): 226 mutantın %97'si öldürüldü; kalanlar eşdeğer mutant (void dönüş,
   proxy argüman şekilleri). Bozulan bir toplama yeşil kalamıyor.
 - **Bir saha koşusu:** 231 GET endpoint, 98 migration ve 63 tenant tablosu olan üretimdeki bir
   Spring Boot uygulaması: 1 kesin sızıntı (tenant filtresiz bir şube-adı alt sorgusu), kod okunarak
   bulunan 1 yazma tarafı IDOR, 5 ilgisiz 500. İlk koşu 15 yanlış LEAK de üretti; aşağıdaki boş
   gövde kuralı ve endpoint hariç tutma bu koşudan çıktı ve 12'sini kaldırıyor.
 
+
+### Ortam matrisi
+
+CI her push/PR'da tam süiti varsayılanlarla koşar (Spring Boot 3.5, Boot BOM'undaki pgjdbc,
+HikariCP, Postgres 16). `matrix` job'ı (`main`'e push, her gece) her seferinde tek bir boyutu
+değiştirir; aşağıdaki her hücre eklenmeden önce lokalde geçti:
+
+| Boyut | Değerler | Komut |
+|---|---|---|
+| Postgres | 13, 14, 15, 16, 17 | `mvn verify -Dtenantguard.pg.image=postgres:15-alpine` |
+| Spring Boot | 3.2, 3.3, 3.4, 3.5 (× PG 16) | `mvn verify -Dboot.version=3.2.12` |
+| pgjdbc | 42.6.2, 42.7.10, 42.7.14 (× PG 16) | `mvn verify -Dpostgresql.version=42.6.2` |
+| Bağlantı havuzu | HikariCP (varsayılan), tomcat-jdbc, DBCP2, c3p0, vibur, havuzsuz; her biri statement cache'li ve cache'siz | `mvn verify -Dtenantguard.pool=c3p0 -Dtenantguard.pool.cache=true` |
+| Tenant kolonu | `text`, `integer`, `bigint`, `uuid`, `company_id`, composite key parçası, `"MixedCase"`, reserved word | `ShapesTestBase` testleri |
+| Şemalar | `public`, çok şemalı `search_path`, `schemas = ...` ile yol dışı tablolar, iki şemada aynı tablo adı | `SchemaShapesTest`, `SearchPathWiringTest` |
+| Uygulama kablolaması | `DataSourceBuilder`, `LazyConnectionDataSourceProxy`, `TransactionAwareDataSourceProxy`, birden fazla DataSource, `AbstractRoutingDataSource`, Liquibase, sahip / yalnızca DML rolüyle `ddl-auto`, NOSUPERUSER sahip, `JpaTransactionManager` + `JdbcTemplate`, `REQUIRES_NEW` | `wiring/*Test` |
+| Mutasyon testi (manuel) | PIT, STRONGER mutator'lar, JDBC çekirdeği | `mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage` |
+
+Desteklenen en eski Spring Boot: 3.2 (Spring Framework 6.1, Hibernate 6.4); Java 21. Boot 3.2'de
+test fixture'ı Flyway 10 ister; `-Dboot.version=3.2.12` bunu otomatik açar.
+
+Matrisin bulup düzelttikleri: havuz **statement cache**'i açıkken (tomcat-jdbc, DBCP2, c3p0,
+vibur) cache'lenmiş bir `PreparedStatement` önceki kullanıcının warning zincirini sonrakine
+devrediyordu; satırlar çift sayılıyor ve A'nın kendi okuması B'ye yazılıyordu. DBCP2'nin `ResultSet`
+wrapper'ı `unwrap`'ta kendini döndürüyor, bu da sonuç başına iki proxy üretiyordu. c3p0 sürücünün
+kapattığı sonucu açık gösterip `getWarnings`'te fırlatıyor. Üçü de düzeltildi ve `PoolMatrixTest`
+ile sabitlendi. Kalan havuz davranışları: statement cache'ler `fetchSize`'ı sonraki ödünç alana
+taşır (bulgular fetch partisi başına bölünür, satır sayıları tam kalır); c3p0 aynı sonuçta
+`executeQuery` sonrası `getResultSet`'i guard olsun olmasın kendi `InternalError`'ıyla reddeder.
+
 ## Yol haritası
 
-- CI'da ortam matrisi: Postgres 13–17, Spring Boot 3.2–3.5 / Hibernate 6.4–6.6, pgjdbc 42.6/42.7,
-  Hikari / Tomcat / DBCP2 / c3p0 / havuzsuz, `int` / `uuid` / `text` tenant id, `public` dışı
-  şemalar, Gradle.
+- Gradle ve Kotlin tüketicileri.
 - Açık kaynak çok kiracılı Spring projelerinde koşular.
 - Kurulumda `security_invoker` olmayan view'lar ve `SECURITY DEFINER` fonksiyonlar için uyarı.
 - Üretilmiş gövdelerle POST/PUT/DELETE taraması; DELETE en sona, sonrasında yeniden seed.
 - Yazma tarafının gözlenmesi (başka kiracıya `INSERT`/`UPDATE`).
 - Sabit `tg|` öneki yerine oturum başına NOTICE nonce'u.
-- `ALTER DEFAULT PRIVILEGES` ve `public` dışı şemalar.
+- Kurulumdan sonra oluşturulan tablolar için `ALTER DEFAULT PRIVILEGES`.
 
 ## Benzer araçlar
 

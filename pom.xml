@@ -15,7 +15,20 @@
     <artifactId>tenant-guard</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <name>tenant-guard</name>
-    <description>Prototype: detect cross-tenant reads from inside the database via an RLS observer policy.</description>
+    <description>Detects cross-tenant data leaks in Spring/JDBC tests from inside PostgreSQL via an RLS observer policy.</description>
+    <url>https://github.com/yavuzhankursun/tenant-guard</url>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+        </license>
+    </licenses>
+
+    <scm>
+        <url>https://github.com/yavuzhankursun/tenant-guard</url>
+        <connection>scm:git:https://github.com/yavuzhankursun/tenant-guard.git</connection>
+    </scm>
 
     <properties>
         <java.version>21</java.version>

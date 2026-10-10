@@ -13,6 +13,10 @@ import java.sql.Statement;
  * again before clearWarnings/close so an ORM that logs-and-clears warnings cannot swallow them.
  * The chain itself is left untouched for the application. Result sets are wrapped as well, because
  * notices from later cursor fetches land on them.
+ *
+ * <p>Statement caches (c3p0 {@code maxStatements}, DBCP2 {@code poolPreparedStatements}, tomcat-jdbc
+ * {@code StatementCache}, vibur) hand the next borrower the same driver statement with its chain
+ * intact. The previous proxy already harvested that chain, so a new proxy starts behind it.
  */
 final class ObservingStatementHandler implements InvocationHandler {
 
@@ -21,7 +25,7 @@ final class ObservingStatementHandler implements InvocationHandler {
     private final TenantGuard guard;
     private final WarningCursor cursor = new WarningCursor();
     private String sql;
-    private ResultSet driverResult;
+    /** The proxy over the statement's current result; null until one is seen after an execute. */
     private ResultSet observedResult;
 
     ObservingStatementHandler(Statement target, Connection owner, TenantGuard guard, String sql) {
@@ -29,6 +33,16 @@ final class ObservingStatementHandler implements InvocationHandler {
         this.owner = owner;
         this.guard = guard;
         this.sql = sql;
+        skipLeftovers();
+    }
+
+    /** Nothing a fresh driver statement carries; a cached one carries the previous borrower's notices. */
+    private void skipLeftovers() {
+        try {
+            cursor.drain(target.getWarnings());
+        } catch (SQLException e) {
+            // A wrapper that cannot report warnings yet has none left over; observing must never fail the app.
+        }
     }
 
     @Override
@@ -40,7 +54,11 @@ final class ObservingStatementHandler implements InvocationHandler {
                 return owner;
             }
             case "getResultSet" -> {
-                return wrapResultSet(call(method, args), (Statement) proxy);
+                return currentResult(call(method, args), (Statement) proxy);
+            }
+            case "getMoreResults" -> {
+                observedResult = null;
+                return call(method, args);
             }
             // unwrap(Statement.class) would otherwise hand out the raw driver statement, which nobody observes.
             case "unwrap" -> {
@@ -65,37 +83,29 @@ final class ObservingStatementHandler implements InvocationHandler {
                 if (args != null && args.length > 0 && args[0] instanceof String executed) {
                     sql = executed;
                 }
+                observedResult = null;
                 Object result = call(method, args);
                 harvest(TenantGuard.HarvestPoint.EXECUTE);
-                return wrapResultSet(result, (Statement) proxy);
+                return currentResult(result, (Statement) proxy);
             }
         }
     }
 
     /**
-     * Pools hand out a fresh wrapper per call (Hikari: executeQuery and getResultSet), so one driver
-     * ResultSet can arrive twice. One observing proxy per driver result keeps one cursor over its
-     * chain; two would count every later-fetch notice twice.
+     * Pools hand out a fresh wrapper per call (Hikari, DBCP2: executeQuery and getResultSet), so one
+     * driver ResultSet can arrive twice, and DBCP2's {@code unwrap} returns the wrapper itself, so
+     * identity cannot tell. JDBC can: until the next execute or getMoreResults, getResultSet returns
+     * the execute's result. One proxy per current result keeps one cursor over its chain; two would
+     * count every later-fetch notice twice.
      */
-    private Object wrapResultSet(Object result, Statement proxy) {
+    private Object currentResult(Object result, Statement proxy) {
         if (!(result instanceof ResultSet rs)) {
             return result;
         }
-        ResultSet driver = driverOf(rs);
-        if (driver != driverResult) {
-            driverResult = driver;
+        if (observedResult == null) {
             observedResult = ObservingResultSetHandler.wrap(rs, proxy, guard, sql);
         }
         return observedResult;
-    }
-
-    /** A wrapper that cannot unwrap only loses the de-duplication; observing must never fail the query. */
-    private static ResultSet driverOf(ResultSet rs) {
-        try {
-            return rs.unwrap(ResultSet.class);
-        } catch (SQLException e) {
-            return rs;
-        }
     }
 
     private void harvest(TenantGuard.HarvestPoint point) throws SQLException {

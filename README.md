@@ -141,7 +141,7 @@ can take `TenantGuard`, `ObserverSetup` and `TenantSeeder` parameters. The annot
 `TenantGuardConfiguration` (guard bean + `DataSource` wrapper) through a meta-`@Import`, which
 Spring Boot's test support honours.
 
-- Auto-discovery skips tables that already have an RLS policy, and quoted/mixed-case names. It
+- Auto-discovery skips tables whose RLS policies never grant `tg_app` anything, and quoted/mixed-case names. It
   logs a warning and lists them with a reason in `ObserverSetup.skippedTables()`. Explicit
   `tables = {...}` fail instead. Finding no observable table at all fails the test.
 - Prefer seeding in `@BeforeEach`? Extension callbacks run *before* `@BeforeEach` methods, so the
@@ -149,6 +149,9 @@ Spring Boot's test support honours.
   guard.reset()`.
 - With `@SpringBootTest(classes = ...)`, Spring Boot ignores nested `@TestConfiguration` classes.
   List the seeder configuration in `classes` too.
+- `ObserverSetup.warnings()` lists what the extension could not make safe, e.g. Spring scheduling
+  being enabled. Setup failures say what to check (DataSource not guarded / missing / ambiguous,
+  observer installed by a non-owner, self-check errors).
 
 ## Self-check
 
@@ -185,6 +188,31 @@ Each row is a test in `src/test` (`ObserverScenariosTest`, `DifferentialScenario
 | differential: `EXISTS(... WHERE lower(number) = 'b-3')` | SUSPECT: diff blind, observer is the only signal |
 | differential: bare `EXISTS(SELECT 1 FROM invoice)` while B has rows | CLEAN: the scan stops at B's first row, A's rows are never read |
 
+
+### What it catches: the leak corpus
+
+`LeakCorpusTest` runs 33 leak patterns as tenant B and asserts all three layers per row
+(observer = `ACTOR_MISMATCH`, passive = `MULTI_TENANT_STATEMENT`, diff = `DifferentialProbe`).
+`CorpusMechanismTest` proves the mechanism behind every blind spot (planner order, owner rights).
+
+| Pattern | Observer | Passive | Diff |
+|---|---|---|---|
+| JPQL / native / `JdbcTemplate` lists, `SUM`, `COUNT`, `MAX`, `MIN`, CTE, `ORDER BY ... LIMIT 1`, `Pageable`, Criteria API, `Specification`, DTO projection without `tenant_id`, `@Transactional(readOnly)`, `@Async`, `StatelessSession`, `getResultStream()`, SQL function (`SECURITY INVOKER`), view `WITH (security_invoker = true)` | caught | caught | LEAK |
+| `findById(victim id)`, `IN (victim ids)` | caught | silent (one tenant per statement) | LEAK |
+| `findById` then in-memory tenant check (404) | caught | silent | SUSPECT |
+| `EXISTS ... WHERE lower(name) = ?` (not leakproof) | caught | caught | SUSPECT |
+| `EXISTS ... WHERE name = ?` (leakproof), name nobody has | **blind** | blind | CLEAN |
+| same, probing the victim's name | caught | silent | LEAK |
+| child rows filtered through a JOIN on the parent's tenant (correct code) | false positive | false positive | CLEAN → SUSPECT |
+| `@Cacheable` over a leaky query | **blind** after the baseline warmed the cache | blind | CLEAN; LEAK once `CacheManager` is cleared after seeding the victim |
+| view without `security_invoker` | **blind**: RLS is checked as the view owner, who bypasses it | blind | LEAK |
+| SQL function `SECURITY DEFINER` | **blind**: body runs as the owner | blind | LEAK |
+| controls: `findByTenantId(B)`, `findByIdAndTenantId(victim id, B)` | silent | silent | CLEAN |
+
+So the observer misses four things: leakproof predicates whose answer does not depend on the
+victim, cached responses, default views and `SECURITY DEFINER` functions. The differential probe
+covers the last two; clearing caches between phases covers the third; the first is narrow.
+
 Five silent under-reporting bugs were found by these tests and fixed:
 
 1. pgjdbc clears a statement's warning chain at the start of every `execute`, without going
@@ -217,6 +245,13 @@ Five silent under-reporting bugs were found by these tests and fixed:
   deny-all and the observer would see nothing.
 - **Leakproof predicates and early exits.** Rows rejected by `=` on text/bigint before the
   policy, or never reached (`EXISTS`, `LIMIT`), are not observed.
+- **Views and `SECURITY DEFINER` functions run as their owner**, who bypasses RLS, so the observer
+  does not see reads through them; the differential probe still does. Views
+  `WITH (security_invoker = true)` and `SECURITY INVOKER` functions are observed.
+- **Caches hide reads.** A `@Cacheable` result warmed during the baseline never reaches Postgres
+  again. Clear the `CacheManager` after seeding the victim.
+- **`@Scheduled` jobs run under the global actor.** The extension warns when scheduling is
+  enabled; `tenantguard.scheduling=off` installs a `TaskScheduler` that runs nothing.
 - **The `tg|` NOTICE prefix is spoofable** by the application's own `RAISE NOTICE`.
 - **One NOTICE per row read.** Large seeds and full scans are slow. Seed a handful of rows.
 - **`GRANT ... ON ALL TABLES` covers existing tables only.** Tables created after installation
@@ -242,6 +277,7 @@ class EndpointIsolationIT {
                                    @Autowired ApplicationContext context, @Autowired DataSource dataSource) {
         EndpointScanner.builder(mockMvc, guard)
                 .endpoints(EndpointDiscovery.discover(context))
+                .exclude("/api/v1/tenants/**")                        // platform-admin endpoints, by design cross-tenant
                 .seeder(tenant -> /* insert that tenant's rows, as the owner */)
                 .authenticator(tenant -> request -> { request.addHeader("X-Tenant", tenant); return request; })
                 .resourceIds(ResourceIds.builder()
@@ -259,13 +295,22 @@ The scan runs in phases: seed B → record a baseline of every endpoint without 
 (twice, to mask fields that change on every call) → seed A → call every endpoint as B, with A's
 ids substituted into `{id}`-style variables. Verdicts:
 
-| Verdict   | Meaning                                                                                   |
-|-----------|-------------------------------------------------------------------------------------------|
-| `LEAK`    | 2xx on an endpoint called with A's id, or the response changed after A's data was added    |
-| `SUSPECT` | Response unchanged / 403 / 404, but the observer saw A's rows being read during the call   |
-| `CLEAN`   | Neither                                                                                   |
-| `SKIPPED` | Id could not be resolved (reason in the note), or 401: the authenticator is probably wrong |
-| `ERROR`   | 5xx or handler exception. Fails `assertNoLeaks()`: a crash is not proof of safety          |
+| Verdict    | Meaning                                                                                   |
+|------------|-------------------------------------------------------------------------------------------|
+| `LEAK`     | 2xx **with data** on an endpoint called with A's id, or the response changed after A's data was added |
+| `SUSPECT`  | Response unchanged / empty / 403 / 404, but the observer saw A's rows being read during the call |
+| `CLEAN`    | Neither                                                                                   |
+| `SKIPPED`  | Id could not be resolved (reason in the note), or 401: the authenticator is probably wrong |
+| `EXCLUDED` | Matched `.exclude(antPattern)` / `.excludeIf(predicate)`; never called, listed with the rule |
+| `ERROR`    | 5xx or handler exception. Fails `assertNoLeaks()`: a crash is not proof of safety          |
+
+**Empty bodies are not leaks.** A correctly filtered query finds nothing for the victim's id and
+still answers `200 []`, `{}`, `null`, `0`, `0.00` or `false`. Such a 2xx is SUSPECT when the
+observer saw the victim's rows, CLEAN otherwise (`200 with empty body [] for tenant A's
+/invoices/3/lines`). The check is flat on purpose: `{"items": [], "total": 0}` still counts as
+data. If the victim's real value could be `0` or `false`, seed it with `Extremes`.
+
+Excluding every endpoint, or resolving none, fails with `No endpoint was verified`.
 
 `assertNoLeaks()` prints a table like this one from the sample app:
 
@@ -284,8 +329,27 @@ Nested ids are resolved independently, so `/invoices/{a}/lines/{b}` usually need
 Only `GET` is scanned; query parameters, pagination and request bodies are not generated.
 Calls are sequential because the guard's actor is global.
 
+## How this is verified
+
+- **231 tests** against Postgres 16 in Testcontainers, on every push (GitHub Actions).
+- **33-path JDBC access matrix** (`JdbcPathMatrixTest`): the same leak through every Statement,
+  PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate and `unwrap` path.
+- **33-pattern leak corpus** (above), every blind spot with a mechanism test.
+- **Mutation testing** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, PIT with the
+  STRONGER mutators on the JDBC core): 96% of 227 mutants killed; the 8 survivors are equivalent
+  (void returns, proxy argument shapes). A broken harvest cannot stay green.
+- **One field run** on a production Spring Boot app with 231 GET endpoints, 98 migrations and 63
+  tenant tables: 1 confirmed leak (a branch-name subquery without a tenant filter), 1 write-side
+  IDOR found by reading the code, 5 unrelated 500s. The first run also produced 15 false LEAKs;
+  the empty-body rule and endpoint exclusion below came out of it and remove 12 of them.
+
 ## Roadmap
 
+- Environment matrix in CI: Postgres 13–17, Spring Boot 3.2–3.5 / Hibernate 6.4–6.6, pgjdbc
+  42.6/42.7, Hikari / Tomcat / DBCP2 / c3p0 / no pool, `int` / `uuid` / `text` tenant ids,
+  non-`public` schemas, Gradle.
+- Runs against open-source multi-tenant Spring projects.
+- Warn about views without `security_invoker` and `SECURITY DEFINER` functions at install time.
 - POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
 - Write-side observation (`INSERT`/`UPDATE` into another tenant).
 - Per-session NOTICE nonce instead of the fixed `tg|` prefix.

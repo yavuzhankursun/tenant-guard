@@ -150,6 +150,9 @@ getirir; Spring Boot'un test desteği bunu tanır.
   edin, sonra `guard.activate(); guard.reset()`.
 - `@SpringBootTest(classes = ...)` kullanıldığında Spring Boot iç içe `@TestConfiguration`
   sınıflarını yok sayar. Seeder konfigürasyonunu `classes` listesine de ekleyin.
+- `ObserverSetup.warnings()` eklentinin güvenli hale getiremediklerini listeler, ör. Spring
+  scheduling'in açık olması. Kurulum hataları neyi kontrol edeceğinizi söyler (DataSource
+  sarmalanmamış / yok / birden fazla, sahip olmayan kullanıcıyla kurulum, self-check hataları).
 
 ## Self-check
 
@@ -187,6 +190,31 @@ Her satır `src/test` altında bir testtir (`ObserverScenariosTest`, `Differenti
 | diferansiyel: `EXISTS(... WHERE lower(number) = 'b-3')` | SUSPECT: fark kör, tek sinyal gözlemci |
 | diferansiyel: B'nin satırları varken çıplak `EXISTS(SELECT 1 FROM invoice)` | CLEAN: tarama B'nin ilk satırında durur, A'nın satırları hiç okunmaz |
 
+
+### Ne yakalıyor: sızıntı korpusu
+
+`LeakCorpusTest` 33 sızıntı kalıbını B kiracısı olarak çalıştırır ve her satırda üç katmanı birden
+doğrular (gözlemci = `ACTOR_MISMATCH`, pasif = `MULTI_TENANT_STATEMENT`, fark = `DifferentialProbe`).
+`CorpusMechanismTest` her kör noktanın mekanizmasını kanıtlar (planner sırası, sahip hakları).
+
+| Kalıp | Gözlemci | Pasif | Fark |
+|---|---|---|---|
+| JPQL / native / `JdbcTemplate` listeleri, `SUM`, `COUNT`, `MAX`, `MIN`, CTE, `ORDER BY ... LIMIT 1`, `Pageable`, Criteria API, `Specification`, `tenant_id` seçmeyen DTO projection, `@Transactional(readOnly)`, `@Async`, `StatelessSession`, `getResultStream()`, SQL fonksiyonu (`SECURITY INVOKER`), `WITH (security_invoker = true)` view | yakalar | yakalar | LEAK |
+| `findById(kurban id)`, `IN (kurban id'leri)` | yakalar | sessiz (statement'ta tek kiracı) | LEAK |
+| `findById` sonra bellekte tenant kontrolü (404) | yakalar | sessiz | SUSPECT |
+| `EXISTS ... WHERE lower(name) = ?` (leakproof değil) | yakalar | yakalar | SUSPECT |
+| `EXISTS ... WHERE name = ?` (leakproof), kimsede olmayan ad | **kör** | kör | CLEAN |
+| aynısı, kurbanın adı sorgulanınca | yakalar | sessiz | LEAK |
+| üst tablonun tenant'ı üzerinden JOIN ile filtrelenen alt satırlar (doğru kod) | yanlış alarm | yanlış alarm | CLEAN → SUSPECT |
+| sızdıran sorgunun üstünde `@Cacheable` | baseline cache'i ısıtınca **kör** | kör | CLEAN; kurban seed edildikten sonra `CacheManager` temizlenirse LEAK |
+| `security_invoker` olmayan view | **kör**: RLS view sahibi olarak kontrol edilir, sahip muaf | kör | LEAK |
+| `SECURITY DEFINER` SQL fonksiyonu | **kör**: gövde sahip olarak çalışır | kör | LEAK |
+| kontroller: `findByTenantId(B)`, `findByIdAndTenantId(kurban id, B)` | sessiz | sessiz | CLEAN |
+
+Yani gözlemcinin dört kör noktası var: cevabı kurbana bağlı olmayan leakproof koşullar,
+cache'lenmiş yanıtlar, varsayılan view'lar ve `SECURITY DEFINER` fonksiyonlar. Son ikisini fark
+katmanı kapatır; üçüncüsünü aşamalar arasında cache temizlemek; ilki dardır.
+
 Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
 
 1. pgjdbc, her `execute` başında statement'ın warning zincirini `clearWarnings()`'e uğramadan
@@ -219,6 +247,13 @@ Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
   restrictive politika "hepsini reddet" demektir ve gözlemci hiçbir şey göremezdi.
 - **Leakproof koşullar ve erken çıkışlar.** Politikadan önce text/bigint `=` ile elenen ya da hiç
   ulaşılmayan (`EXISTS`, `LIMIT`) satırlar gözlenmez.
+- **View'lar ve `SECURITY DEFINER` fonksiyonlar sahibi olarak çalışır**; sahip RLS'ten muaf olduğu
+  için gözlemci bunlar üzerinden yapılan okumaları görmez, fark katmanı görür.
+  `WITH (security_invoker = true)` view'lar ve `SECURITY INVOKER` fonksiyonlar gözlenir.
+- **Cache okumayı gizler.** Baseline sırasında ısınan bir `@Cacheable` sonucu Postgres'e bir daha
+  ulaşmaz. Kurbanı seed ettikten sonra `CacheManager`'ı temizleyin.
+- **`@Scheduled` işler global aktör altında çalışır.** Scheduling açıksa eklenti uyarır;
+  `tenantguard.scheduling=off` hiçbir işi çalıştırmayan bir `TaskScheduler` kurar.
 - **`tg|` NOTICE öneki taklit edilebilir:** uygulamanın kendi `RAISE NOTICE`'i aynı öneki
   kullanırsa yanlış bulgu üretir.
 - **Okunan satır başına bir NOTICE.** Büyük seed'ler ve tam taramalar yavaştır. Bir avuç satır
@@ -246,6 +281,7 @@ class EndpointIsolationIT {
                                    @Autowired ApplicationContext context, @Autowired DataSource dataSource) {
         EndpointScanner.builder(mockMvc, guard)
                 .endpoints(EndpointDiscovery.discover(context))
+                .exclude("/api/v1/tenants/**")                        // platform-admin endpoint'leri, tasarım gereği çok kiracılı
                 .seeder(tenant -> /* o kiracının satırlarını sahibi olarak ekle */)
                 .authenticator(tenant -> request -> { request.addHeader("X-Tenant", tenant); return request; })
                 .resourceIds(ResourceIds.builder()
@@ -263,13 +299,22 @@ Tarama aşamalarla ilerler: B'yi seed et → path değişkeni olmayan her endpoi
 baseline kaydet (her istekte değişen alanları ayıklamak için iki kez) → A'yı seed et → her
 endpoint'i B olarak çağır, `{id}` tipi değişkenlere A'nın id'lerini koy. Kararlar:
 
-| Karar     | Anlamı                                                                                        |
-|-----------|-----------------------------------------------------------------------------------------------|
-| `LEAK`    | A'nın id'siyle çağrılan endpoint 2xx döndü, ya da A'nın verisi eklenince yanıt değişti         |
-| `SUSPECT` | Yanıt değişmedi / 403 / 404, ama gözlemci çağrı sırasında A'nın satırlarının okunduğunu gördü |
-| `CLEAN`   | İkisi de değil                                                                                |
-| `SKIPPED` | Id çözülemedi (gerekçe notta) ya da 401: authenticator büyük ihtimalle yanlış                 |
-| `ERROR`   | 5xx ya da handler exception. `assertNoLeaks()`'i düşürür: çökmek güvenliğin kanıtı değildir  |
+| Karar      | Anlamı                                                                                        |
+|------------|-----------------------------------------------------------------------------------------------|
+| `LEAK`     | A'nın id'siyle çağrılan endpoint **veri içeren** 2xx döndü, ya da A'nın verisi eklenince yanıt değişti |
+| `SUSPECT`  | Yanıt değişmedi / boş / 403 / 404, ama gözlemci çağrı sırasında A'nın satırlarının okunduğunu gördü |
+| `CLEAN`    | İkisi de değil                                                                                |
+| `SKIPPED`  | Id çözülemedi (gerekçe notta) ya da 401: authenticator büyük ihtimalle yanlış                 |
+| `EXCLUDED` | `.exclude(antPattern)` / `.excludeIf(predicate)` ile eşleşti; hiç çağrılmaz, kuralıyla listelenir |
+| `ERROR`    | 5xx ya da handler exception. `assertNoLeaks()`'i düşürür: çökmek güvenliğin kanıtı değildir  |
+
+**Boş gövde sızıntı değildir.** Doğru filtrelenmiş bir sorgu kurbanın id'si için hiçbir şey bulmaz
+ve yine de `200 []`, `{}`, `null`, `0`, `0.00` ya da `false` döner. Böyle bir 2xx, gözlemci kurbanın
+satırlarını gördüyse SUSPECT, görmediyse CLEAN'dir (`200 with empty body [] for tenant A's
+/invoices/3/lines`). Kontrol bilerek düzdür: `{"items": [], "total": 0}` yine veri sayılır.
+Kurbanın gerçek değeri `0` ya da `false` olabiliyorsa `Extremes` ile seed edin.
+
+Her endpoint'i hariç tutmak ya da hiçbirini çözememek `No endpoint was verified` ile düşer.
 
 `assertNoLeaks()` örnek uygulamada şuna benzer bir tablo basar:
 
@@ -288,8 +333,28 @@ id'ler bağımsız çözülür; `/invoices/{a}/lines/{b}` genellikle override is
 taranır; query parametresi, pagination ve istek gövdesi üretilmez. Guard'ın aktörü global olduğu
 için çağrılar sıralıdır.
 
+## Nasıl doğrulanıyor
+
+- Her push'ta Testcontainers Postgres 16 üzerinde **231 test** (GitHub Actions).
+- **33 yollu JDBC erişim matrisi** (`JdbcPathMatrixTest`): aynı sızıntı Statement,
+  PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate ve `unwrap` yollarının her
+  birinden.
+- **33 kalıplık sızıntı korpusu** (yukarıda), her kör nokta için mekanizma testi.
+- **Mutasyon testi** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, JDBC çekirdeğinde
+  PIT STRONGER mutator'ları): 227 mutantın %96'sı öldürüldü; kalan 8'i eşdeğer mutant (void dönüş,
+  proxy argüman şekilleri). Bozulan bir toplama yeşil kalamıyor.
+- **Bir saha koşusu:** 231 GET endpoint, 98 migration ve 63 tenant tablosu olan üretimdeki bir
+  Spring Boot uygulaması: 1 kesin sızıntı (tenant filtresiz bir şube-adı alt sorgusu), kod okunarak
+  bulunan 1 yazma tarafı IDOR, 5 ilgisiz 500. İlk koşu 15 yanlış LEAK de üretti; aşağıdaki boş
+  gövde kuralı ve endpoint hariç tutma bu koşudan çıktı ve 12'sini kaldırıyor.
+
 ## Yol haritası
 
+- CI'da ortam matrisi: Postgres 13–17, Spring Boot 3.2–3.5 / Hibernate 6.4–6.6, pgjdbc 42.6/42.7,
+  Hikari / Tomcat / DBCP2 / c3p0 / havuzsuz, `int` / `uuid` / `text` tenant id, `public` dışı
+  şemalar, Gradle.
+- Açık kaynak çok kiracılı Spring projelerinde koşular.
+- Kurulumda `security_invoker` olmayan view'lar ve `SECURITY DEFINER` fonksiyonlar için uyarı.
 - Üretilmiş gövdelerle POST/PUT/DELETE taraması; DELETE en sona, sonrasında yeniden seed.
 - Yazma tarafının gözlenmesi (başka kiracıya `INSERT`/`UPDATE`).
 - Sabit `tg|` öneki yerine oturum başına NOTICE nonce'u.

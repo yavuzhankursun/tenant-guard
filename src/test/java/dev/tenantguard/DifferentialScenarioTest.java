@@ -6,6 +6,7 @@ import dev.tenantguard.DifferentialProbe.Endpoint;
 import dev.tenantguard.DifferentialProbe.Result;
 import dev.tenantguard.DifferentialProbe.Verdict;
 import dev.tenantguard.sample.InvoiceRepository;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -16,7 +17,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 
 /**
- * Scenario 9: before/after diff. Starts with B's data only; A is seeded mid-test.
+ * Scenario 9: before/after diff. Starts with B's data only; A is seeded mid-test with
+ * {@link Extremes} amounts, so MAX/MIN/ORDER BY ... LIMIT change when A's rows leak.
  * Repository/JDBC calls stand in for the list and report endpoints the scanner will hit over HTTP.
  */
 class DifferentialScenarioTest extends GuardedTestBase {
@@ -42,14 +44,24 @@ class DifferentialScenarioTest extends GuardedTestBase {
                 new Endpoint("join-filtered", () -> jdbc.queryForList(
                         "SELECT l.id, l.description FROM invoice_line l JOIN invoice i ON i.id = l.invoice_id "
                                 + "WHERE i.tenant_id = 'B' ORDER BY l.id")),
-                new Endpoint("leaky-max", () -> jdbc.queryForObject("SELECT max(amount) FROM invoice", Long.class)));
+                new Endpoint("leaky-max", () -> jdbc.queryForObject("SELECT max(amount) FROM invoice", BigDecimal.class)),
+                new Endpoint("leaky-min", () -> jdbc.queryForObject("SELECT min(amount) FROM invoice", BigDecimal.class)),
+                new Endpoint("leaky-top1", () -> jdbc.queryForObject(
+                        "SELECT number FROM invoice ORDER BY amount DESC LIMIT 1", String.class)),
+                // "Is this number free?" checked across all tenants: false before and after A arrives.
+                // lower() is not LEAKPROOF, so the policy runs first and sees every row. With a plain
+                // `number = 'B-3'` the leakproof texteq runs before the policy and A's rows are never observed.
+                new Endpoint("leaky-exists", () -> jdbc.queryForObject(
+                        "SELECT EXISTS(SELECT 1 FROM invoice WHERE lower(number) = 'b-3')", Boolean.class)),
+                new Endpoint("exists-any", () -> jdbc.queryForObject(
+                        "SELECT EXISTS(SELECT 1 FROM invoice)", Boolean.class)));
     }
 
     @Test
-    @DisplayName("9a. Önce/sonra farkı, A sıradan değerlerle: SUM ve liste kesin, JOIN susmuyor ama şüpheli, MAX kaçıyor")
-    void beforeAfterDiffWithOrdinarySeed() {
+    @DisplayName("9a. Önce/sonra farkı, A uç değerlerle: SUM, liste, MAX, MIN, TOP-1 kesin; JOIN şüpheli; filtreli temiz")
+    void beforeAfterDiffWithExtremeSeed() {
         DifferentialProbe probe = DifferentialProbe.recordBaseline(guard, TENANT_B, endpoints());
-        seedTenantAsOwner(TENANT_A, 1);
+        seedTenantAsOwner(TENANT_A);
         Map<String, Result> results = byName(probe.compare());
         report(results);
 
@@ -60,20 +72,36 @@ class DifferentialScenarioTest extends GuardedTestBase {
         assertThat(results.get("filtered-list").verdict()).isEqualTo(Verdict.CLEAN);
         // Diff is silent on the correctly filtered join, but the observer still flags it.
         assertThat(results.get("join-filtered").verdict()).isEqualTo(Verdict.SUSPECT);
-        // A's amounts do not exceed B's, so MAX is unchanged: a real leak the diff cannot see.
-        assertThat(results.get("leaky-max").verdict()).isEqualTo(Verdict.SUSPECT);
+        // With ordinary seed values MAX stayed unchanged (SUSPECT only); A's extremes move all three.
+        assertThat(results.get("leaky-max").verdict()).isEqualTo(Verdict.LEAK);
+        assertThat(results.get("leaky-min").verdict()).isEqualTo(Verdict.LEAK);
+        assertThat(results.get("leaky-top1").verdict()).isEqualTo(Verdict.LEAK);
     }
 
     @Test
-    @DisplayName("9b. Önce/sonra farkı, A uç değerlerle: MAX de kesin olur")
-    void beforeAfterDiffWithExtremeSeed() {
+    @DisplayName("9b. EXISTS: boolean cevap değişmiyor, fark kör; tek sinyal gözlemci (SUSPECT)")
+    void existsIsBlindToTheDiffOnlyTheObserverSeesIt() {
         DifferentialProbe probe = DifferentialProbe.recordBaseline(guard, TENANT_B, endpoints());
-        seedTenantAsOwner(TENANT_A, 1_000);
-        Map<String, Result> results = byName(probe.compare());
-        report(results);
+        seedTenantAsOwner(TENANT_A);
+        Result exists = byName(probe.compare()).get("leaky-exists");
+        report(Map.of("leaky-exists", exists));
 
-        assertThat(results.get("leaky-max").verdict()).isEqualTo(Verdict.LEAK);
-        assertThat(results.get("join-filtered").verdict()).isEqualTo(Verdict.SUSPECT);
+        assertThat(exists.changedPaths()).isEmpty();
+        assertThat(exists.verdict()).isEqualTo(Verdict.SUSPECT);
+        assertThat(exists.observerFindings()).extracting(Finding::table).contains("invoice");
+    }
+
+    @Test
+    @DisplayName("9c. Filtresiz EXISTS, B'nin satırı varken: executor B'nin ilk satırında durur, iki katman da kör (CLEAN)")
+    void unfilteredExistsStopsAtTheFirstRowAndBothLayersAreBlind() {
+        DifferentialProbe probe = DifferentialProbe.recordBaseline(guard, TENANT_B, endpoints());
+        seedTenantAsOwner(TENANT_A);
+        Result exists = byName(probe.compare()).get("exists-any");
+        report(Map.of("exists-any", exists));
+
+        // B's rows come first in the heap, so A's rows are never read and nothing of A's is disclosed
+        // for this data. With B empty the answer would flip false -> true and the diff would see it.
+        assertThat(exists.verdict()).isEqualTo(Verdict.CLEAN);
     }
 
     private static Map<String, Result> byName(List<Result> results) {

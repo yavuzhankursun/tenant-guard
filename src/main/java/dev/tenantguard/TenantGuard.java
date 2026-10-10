@@ -1,6 +1,7 @@
 package dev.tenantguard;
 
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,6 +25,7 @@ public final class TenantGuard {
     private final List<Observation> observations = new CopyOnWriteArrayList<>();
     private final List<Finding> findings = new CopyOnWriteArrayList<>();
     private final Map<HarvestPoint, LongAdder> harvested = new ConcurrentHashMap<>();
+    private final Map<RowRead, LongAdder> reads = new ConcurrentHashMap<>();
 
     public void activate() {
         active.set(true);
@@ -71,10 +73,21 @@ public final class TenantGuard {
         return Map.copyOf(snapshot);
     }
 
+    /**
+     * How often each (table, tenant) row read was observed. Observations collapse rows into sets, so
+     * only this count shows a harvest that lost or double-counted notices.
+     */
+    public Map<RowRead, Long> rowReads() {
+        Map<RowRead, Long> snapshot = new HashMap<>();
+        reads.forEach((read, count) -> snapshot.put(read, count.sum()));
+        return Map.copyOf(snapshot);
+    }
+
     public void reset() {
         observations.clear();
         findings.clear();
         harvested.clear();
+        reads.clear();
     }
 
     void record(String sql, List<RowRead> rows, HarvestPoint point) {
@@ -82,6 +95,7 @@ public final class TenantGuard {
             return;
         }
         harvested.computeIfAbsent(point, p -> new LongAdder()).add(rows.size());
+        rows.forEach(row -> reads.computeIfAbsent(row, r -> new LongAdder()).increment());
         Observation observation = Observation.of(sql, actor.get(), rows);
         observations.add(observation);
         findings.addAll(Finding.evaluate(observation));

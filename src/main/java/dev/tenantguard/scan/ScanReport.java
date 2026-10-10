@@ -13,6 +13,7 @@ public final class ScanReport {
 
     private static final Set<Verdict> LEAKS = EnumSet.of(Verdict.LEAK, Verdict.ERROR);
     private static final Set<Verdict> LEAKS_OR_SUSPECTS = EnumSet.of(Verdict.LEAK, Verdict.ERROR, Verdict.SUSPECT);
+    private static final Set<Verdict> NOT_VERIFIED = EnumSet.of(Verdict.SKIPPED, Verdict.EXCLUDED);
 
     private final String victim;
     private final String attacker;
@@ -49,9 +50,13 @@ public final class ScanReport {
         failOn(LEAKS_OR_SUSPECTS);
     }
 
+    /**
+     * Excluding or skipping everything must not pass silently: an empty verification looks exactly
+     * like a clean app.
+     */
     private void failOn(Set<Verdict> failing) {
-        if (!results.isEmpty() && results.stream().allMatch(r -> r.verdict() == Verdict.SKIPPED)) {
-            throw new AssertionError("No endpoint was verified: all %d SKIPPED%n%s".formatted(results.size(), table(results)));
+        if (!results.isEmpty() && results.stream().allMatch(r -> NOT_VERIFIED.contains(r.verdict()))) {
+            throw new AssertionError("No endpoint was verified: %s%n%s".formatted(counts(results), table(results)));
         }
         List<ScanResult> failed = results.stream().filter(r -> failing.contains(r.verdict())).toList();
         if (failed.isEmpty()) {

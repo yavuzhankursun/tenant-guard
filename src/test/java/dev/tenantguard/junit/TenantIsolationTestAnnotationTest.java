@@ -79,6 +79,11 @@ class TenantIsolationTestAnnotationTest {
     }
 
     @Test
+    void noSchedulingMeansNoWarnings(ObserverSetup setup) {
+        assertThat(setup.warnings()).isEmpty();
+    }
+
+    @Test
     void leakyFindAllAsAttackerIsCaught(TenantGuard guard) {
         guard.runAs("B", invoices::findAll);
 

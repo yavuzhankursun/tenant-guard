@@ -41,6 +41,51 @@ jobs:
           name: surefire-reports
           path: target/surefire-reports
 
+  examples:
+    # The library as a consumer sees it: installed into ~/.m2, then used from a Gradle/Kotlin app and
+    # from the Maven Spring Data example. Catches coordinate, packaging and transitive-dependency
+    # mistakes the library's own tests cannot.
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # Gradle cache, and a checksum check of the committed gradle-wrapper.jar against Gradle's
+      # published ones (a PR could otherwise swap the binary).
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+      - name: Install tenant-guard into ~/.m2
+        id: install
+        run: |
+          mvn -B --no-transfer-progress -DskipTests install
+          echo "version=$(mvn -B -q --no-transfer-progress help:evaluate -Dexpression=project.version -DforceStdout)" >> "$GITHUB_OUTPUT"
+      # The examples get the version just installed, so a version bump cannot leave them behind.
+      - name: Gradle + Kotlin consumer
+        working-directory: examples/gradle-kotlin-consumer
+        env:
+          TG_VERSION: ${{ steps.install.outputs.version }}
+        run: ./gradlew test "-PtenantGuardVersion=$TG_VERSION"
+      - name: Spring Data @TenantId example
+        working-directory: examples/spring-data-tenantid
+        env:
+          TG_VERSION: ${{ steps.install.outputs.version }}
+        run: mvn -B --no-transfer-progress test "-Dtenant-guard.version=$TG_VERSION"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: examples-test-reports
+          path: |
+            examples/gradle-kotlin-consumer/build/reports/tests
+            examples/spring-data-tenantid/target/surefire-reports
+          if-no-files-found: ignore
+
   matrix:
     # One dimension at a time against the default build, not a cross product. An empty value means
     # the default (Boot 3.5.11, the Boot-managed pgjdbc, Hikari); every entry names its Postgres.

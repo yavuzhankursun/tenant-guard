@@ -1,6 +1,7 @@
 package dev.tenantguard;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.math.BigDecimal;
 import java.sql.Array;
@@ -77,6 +78,9 @@ class ExtremesTest {
     @ParameterizedTest
     @ValueSource(strings = {"C", "en-x-icu", "und-x-icu"})
     void stringsSortFirstAndLastUnderCommonCollations(String collation) throws SQLException {
+        // ICU collations exist only when the server was built --with-icu (every official image is).
+        assumeTrue(collationExists(collation), () -> "collation \"" + collation + "\" not in pg_collation on "
+                + TestPostgres.image());
         List<String> realistic = "C".equals(collation)
                 // Byte order: text starting with a non-ASCII letter sorts after any ASCII value (documented).
                 ? REALISTIC_TEXT.stream().filter(s -> s.chars().allMatch(ch -> ch < 128)).toList()
@@ -87,6 +91,16 @@ class ExtremesTest {
 
         assertThat(sorted.get(0)).isEqualTo(Extremes.strings().get(0));
         assertThat(sorted.get(sorted.size() - 1)).isEqualTo(Extremes.strings().get(1));
+    }
+
+    private static boolean collationExists(String collation) throws SQLException {
+        try (Connection c = GuardedTestBase.ownerConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT 1 FROM pg_collation WHERE collname = ?")) {
+            ps.setString(1, collation);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
     }
 
     private static List<String> sortInPostgres(List<String> values, String collation) throws SQLException {

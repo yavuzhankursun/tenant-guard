@@ -33,7 +33,7 @@ public abstract class GuardedTestBase {
     static final String TENANT_B = "B";
 
     /** Testcontainers' default user is a superuser: exactly the setup that would make RLS silently inert. */
-    public static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+    public static final PostgreSQLContainer<?> POSTGRES = TestPostgres.container();
 
     static {
         POSTGRES.start();

@@ -5,6 +5,7 @@ import static dev.tenantguard.DifferentialProbe.Verdict.LEAK;
 import static dev.tenantguard.DifferentialProbe.Verdict.SUSPECT;
 import static dev.tenantguard.corpus.LeakCorpusTest.Layer.CAUGHT;
 import static dev.tenantguard.corpus.LeakCorpusTest.Layer.SILENT;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import dev.tenantguard.DifferentialProbe;
 import dev.tenantguard.DifferentialProbe.Endpoint;
@@ -49,9 +50,15 @@ class LeakCorpusTest extends CorpusTestBase {
     /**
      * @param call         builds the B-side call from the test's beans
      * @param beforeCall   runs after A is seeded, before the compare call and again before the observer call
+     * @param minServerVersion lowest {@code server_version_num} the pattern exists on; older servers skip the row
      */
     record Pattern(String id, String name, Layer observer, Layer passive, Verdict diff,
-                   Function<LeakCorpusTest, Supplier<Object>> call, Consumer<LeakCorpusTest> beforeCall, String note) {
+                   Function<LeakCorpusTest, Supplier<Object>> call, Consumer<LeakCorpusTest> beforeCall, String note,
+                   int minServerVersion) {
+
+        Pattern since(int serverVersionNum) {
+            return new Pattern(id, name, observer, passive, diff, call, beforeCall, note, serverVersionNum);
+        }
 
         @Override
         public String toString() {
@@ -61,7 +68,7 @@ class LeakCorpusTest extends CorpusTestBase {
 
     private static Pattern row(String id, String name, Layer observer, Layer passive, Verdict diff,
                                Function<LeakCorpusTest, Supplier<Object>> call, String note) {
-        return new Pattern(id, name, observer, passive, diff, call, test -> { }, note);
+        return new Pattern(id, name, observer, passive, diff, call, test -> { }, note, 0);
     }
 
     private static final String OPEN = "open";
@@ -124,7 +131,7 @@ class LeakCorpusTest extends CorpusTestBase {
                         "BLIND: the baseline warmed the cache, later calls never reach the database"),
                 new Pattern("18b", "@Cacheable over a leaky SUM, cache cleared after seeding", CAUGHT, CAUGHT, LEAK,
                         t -> () -> t.cached.cachedTotal(), CorpusTestBase::clearCaches,
-                        "workaround: CacheManager clear after seeding the victim"),
+                        "workaround: CacheManager clear after seeding the victim", 0),
                 row("19", "@Transactional(readOnly = true) read", CAUGHT, CAUGHT, LEAK,
                         t -> () -> t.queries.readOnlyAll(), "NOTICE survives READ ONLY"),
                 row("20", "@Async read on a task-executor thread", CAUGHT, CAUGHT, LEAK,
@@ -138,7 +145,7 @@ class LeakCorpusTest extends CorpusTestBase {
                         t -> () -> t.invoices.viewSum(),
                         "OBSERVER BLIND: base-table RLS is checked as the view owner, the table owner, who bypasses it"),
                 row("23b", "view WITH (security_invoker = true)", CAUGHT, CAUGHT, LEAK,
-                        t -> () -> t.invoices.invokerViewSum(), "RLS checked as tg_app"),
+                        t -> () -> t.invoices.invokerViewSum(), "RLS checked as tg_app").since(150000),
                 row("24", "SQL function, SECURITY INVOKER", CAUGHT, CAUGHT, LEAK,
                         t -> () -> t.queries.functionTotal(), "body runs as tg_app; NOTICE reaches the client"),
                 row("24b", "SQL function, SECURITY DEFINER", SILENT, SILENT, LEAK,
@@ -176,6 +183,9 @@ class LeakCorpusTest extends CorpusTestBase {
     @MethodSource("corpus")
     @DisplayName("Leak corpus: pattern → layers")
     void pattern(Pattern pattern) {
+        int server = jdbc.queryForObject("SELECT current_setting('server_version_num')::int", Integer.class);
+        assumeTrue(server >= pattern.minServerVersion(), () -> "%s (%s) needs server_version_num >= %d, this server is %d"
+                .formatted(pattern.id(), pattern.name(), pattern.minServerVersion(), server));
         Supplier<Object> call = pattern.call().apply(this);
 
         DifferentialProbe probe = DifferentialProbe.recordBaseline(guard, ATTACKER,

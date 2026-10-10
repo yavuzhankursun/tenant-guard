@@ -45,11 +45,13 @@ final class ObservingResultSetHandler implements InvocationHandler {
             case "getStatement" -> {
                 return owner;
             }
+            // unwrap(ResultSet.class) would otherwise hand out the raw result, whose later fetches nobody observes.
+            case "unwrap" -> {
+                return ((Class<?>) args[0]).isInstance(proxy) ? proxy : call(method, args);
+            }
             case "clearWarnings" -> {
                 harvest();
-                Object result = call(method, args);
-                cursor.reset();
-                return result;
+                return call(method, args);
             }
             case "close" -> {
                 if (!target.isClosed()) {

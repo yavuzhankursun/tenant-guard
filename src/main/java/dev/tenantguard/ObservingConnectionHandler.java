@@ -29,6 +29,11 @@ final class ObservingConnectionHandler implements InvocationHandler {
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // unwrap(Connection.class) would otherwise hand out the raw driver connection, whose statements
+        // nobody observes. Driver-specific types (PgConnection) still get the raw object: a known blind spot.
+        if ("unwrap".equals(method.getName()) && ((Class<?>) args[0]).isInstance(proxy)) {
+            return proxy;
+        }
         Object result;
         try {
             result = method.invoke(target, args);

@@ -99,7 +99,7 @@ leaks.
 
 ```java
 @SpringBootTest
-@TenantIsolationTest(tenantColumn = "tenant_id")   // tables: every table in the current schema with that column
+@TenantIsolationTest(tenantColumn = "tenant_id")   // tables: every table on the search_path with that column
 class TenantIsolationIT {
 
     @TestConfiguration
@@ -141,9 +141,21 @@ can take `TenantGuard`, `ObserverSetup` and `TenantSeeder` parameters. The annot
 `TenantGuardConfiguration` (guard bean + `DataSource` wrapper) through a meta-`@Import`, which
 Spring Boot's test support honours.
 
-- Auto-discovery skips tables whose RLS policies never grant `tg_app` anything, and quoted/mixed-case names. It
-  logs a warning and lists them with a reason in `ObserverSetup.skippedTables()`. Explicit
-  `tables = {...}` fail instead. Finding no observable table at all fails the test.
+- Auto-discovery searches every schema on the app connection's `search_path`, or the ones named in
+  `schemas = {...}`. Mixed-case names and reserved words are quoted and observed; names with
+  quotes, `|`, `.`, whitespace or control characters, and tables whose RLS policies never grant
+  `tg_app` anything, are skipped with a reason in `ObserverSetup.skippedTables()`. Explicit
+  `tables = {...}` (`table` or `schema.table`) fail instead. No observable table fails the test.
+- The actor is compared with `tenant_column::text` exactly, whatever the column type (`integer`,
+  `bigint`, `uuid`, `text`, `company_id`...): pass `String.valueOf(id)` or `UUID.toString()`. There
+  is no numeric normalization on purpose: `"02"` and `"2"` are different text tenants, and a
+  wrongly formatted actor fails loudly instead of matching by accident.
+- Several `DataSource` beans? The `@Primary` one is observed; the others are switched off and listed
+  in `ObserverSetup.warnings()`. Observe more with `@TenantIsolationTest(dataSources = {"dataSource",
+  "reporting"})`; an `AbstractRoutingDataSource` is installed and self-checked on every target. The
+  guard is placed directly on the pool, under `LazyConnectionDataSourceProxy` /
+  `TransactionAwareDataSourceProxy` (a guard above the transaction-aware proxy would let raw
+  connections escape the transaction), and the lazy proxy's read-only replica is guarded too.
 - Prefer seeding in `@BeforeEach`? Extension callbacks run *before* `@BeforeEach` methods, so the
   guard is already armed there. Call `guard.deactivate()`, seed, then `guard.activate();
   guard.reset()`.
@@ -225,17 +237,18 @@ Five silent under-reporting bugs were found by these tests and fixed:
    observed. Fix: return the proxy when the requested type is a JDBC interface.
 4. The chain cursor went stale when the driver cleared the chain where we could not see it, so
    new notices were skipped. Fix: a new chain head restarts the count.
-5. Hikari hands out separate wrappers for `executeQuery` and `getResultSet`, so one driver
-   `ResultSet` was wrapped twice and fetch notices counted twice. Fix: one proxy per driver
-   `ResultSet`.
+5. Pools hand out separate wrappers for `executeQuery` and `getResultSet`, so one result was
+   wrapped twice and fetch notices counted twice. Fix: one proxy per current statement result.
 
 ## Assumptions and limitations
 
 - **PostgreSQL only.** The mechanism is RLS + `RAISE NOTICE` + pgjdbc's `SQLWarning` chain.
 - **Schema owned by the app user.** The observer is installed through the guarded `DataSource`
   while inactive, i.e. with the app's own credentials. These must own the tables (Flyway, or
-  migrations run as the app user), not Hibernate `ddl-auto` under a non-owner role. Grants target
-  schema `public`.
+  migrations run as the app user), not Hibernate `ddl-auto` under a non-owner role. `tg_app` is
+  granted every schema on the search_path and every schema holding an observed table. Schema-per-
+  tenant designs without a tenant column (Hibernate `SCHEMA` multitenancy) are out of scope and fail
+  with a message saying so.
 - **No parallel test execution.** The actor and the findings are process-wide, not thread-local.
   That's on purpose: the tenant label survives `@Async` and thread pools.
 - **Tables with their own RLS policies get a RESTRICTIVE observer.** Postgres ORs permissive
@@ -331,29 +344,58 @@ Calls are sequential because the guard's actor is global.
 
 ## How this is verified
 
-- **231 tests** against Postgres 16 in Testcontainers, on every push (GitHub Actions).
+- **503 tests** against Postgres in Testcontainers, on every push (GitHub Actions); the
+  environment matrix below on every push to `main` and nightly.
 - **33-path JDBC access matrix** (`JdbcPathMatrixTest`): the same leak through every Statement,
   PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate and `unwrap` path.
 - **33-pattern leak corpus** (above), every blind spot with a mechanism test.
 - **Mutation testing** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, PIT with the
-  STRONGER mutators on the JDBC core): 96% of 227 mutants killed; the 8 survivors are equivalent
+  STRONGER mutators on the JDBC core): 97% of 226 mutants killed; the survivors are equivalent
   (void returns, proxy argument shapes). A broken harvest cannot stay green.
 - **One field run** on a production Spring Boot app with 231 GET endpoints, 98 migrations and 63
   tenant tables: 1 confirmed leak (a branch-name subquery without a tenant filter), 1 write-side
   IDOR found by reading the code, 5 unrelated 500s. The first run also produced 15 false LEAKs;
   the empty-body rule and endpoint exclusion below came out of it and remove 12 of them.
 
+
+### Environment matrix
+
+CI runs the full suite on every push/PR with the defaults (Spring Boot 3.5, pgjdbc from the Boot
+BOM, HikariCP, Postgres 16). The `matrix` job (push to `main`, nightly) varies one dimension at a
+time; every cell below passed locally before it was added:
+
+| Dimension | Values | Command line |
+|---|---|---|
+| Postgres | 13, 14, 15, 16, 17 | `mvn verify -Dtenantguard.pg.image=postgres:15-alpine` |
+| Spring Boot | 3.2, 3.3, 3.4, 3.5 (× PG 16) | `mvn verify -Dboot.version=3.2.12` |
+| pgjdbc | 42.6.2, 42.7.10, 42.7.14 (× PG 16) | `mvn verify -Dpostgresql.version=42.6.2` |
+| Connection pool | HikariCP (default), tomcat-jdbc, DBCP2, c3p0, vibur, none; each with and without a statement cache | `mvn verify -Dtenantguard.pool=c3p0 -Dtenantguard.pool.cache=true` |
+| Tenant column | `text`, `integer`, `bigint`, `uuid`, `company_id`, part of a composite key, `"MixedCase"`, reserved words | `ShapesTestBase` tests |
+| Schemas | `public`, `search_path` with several schemas, tables off the path via `schemas = ...`, the same table name in two schemas | `SchemaShapesTest`, `SearchPathWiringTest` |
+| App wiring | `DataSourceBuilder`, `LazyConnectionDataSourceProxy`, `TransactionAwareDataSourceProxy`, several DataSources, `AbstractRoutingDataSource`, Liquibase, `ddl-auto` as owner / as a DML-only role, a NOSUPERUSER owner, `JpaTransactionManager` + `JdbcTemplate`, `REQUIRES_NEW` | `wiring/*Test` |
+| Mutation testing (manual) | PIT, STRONGER mutators, JDBC core | `mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage` |
+
+Minimum supported Spring Boot: 3.2 (Spring Framework 6.1, Hibernate 6.4); Java 21. On Boot 3.2 the
+test fixture needs Flyway 10, which `-Dboot.version=3.2.12` turns on automatically.
+
+What the matrix found and fixed: with a pool **statement cache** on (tomcat-jdbc, DBCP2, c3p0,
+vibur) a cached `PreparedStatement` handed the next borrower the previous borrower's warning chain,
+so rows were counted twice and tenant A's own read was charged to tenant B; DBCP2's `ResultSet`
+wrapper unwraps to itself, which built two proxies per result; c3p0 reports a driver-closed result
+as open but throws on `getWarnings`. All three are fixed and pinned by `PoolMatrixTest`. Pool
+behaviours that remain: statement caches carry `fetchSize` across borrows (findings split per fetch
+batch, row counts stay exact); c3p0 rejects `executeQuery` followed by `getResultSet` on the same
+result with its own `InternalError`, guard or no guard.
+
 ## Roadmap
 
-- Environment matrix in CI: Postgres 13–17, Spring Boot 3.2–3.5 / Hibernate 6.4–6.6, pgjdbc
-  42.6/42.7, Hikari / Tomcat / DBCP2 / c3p0 / no pool, `int` / `uuid` / `text` tenant ids,
-  non-`public` schemas, Gradle.
+- Gradle and Kotlin consumers.
 - Runs against open-source multi-tenant Spring projects.
 - Warn about views without `security_invoker` and `SECURITY DEFINER` functions at install time.
 - POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
 - Write-side observation (`INSERT`/`UPDATE` into another tenant).
 - Per-session NOTICE nonce instead of the fixed `tg|` prefix.
-- `ALTER DEFAULT PRIVILEGES` and non-`public` schemas.
+- `ALTER DEFAULT PRIVILEGES` for tables created after installation.
 
 ## Related tools
 

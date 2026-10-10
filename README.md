@@ -378,6 +378,13 @@ time; every cell below passed locally before it was added:
 Minimum supported Spring Boot: 3.2 (Spring Framework 6.1, Hibernate 6.4); Java 21. On Boot 3.2 the
 test fixture needs Flyway 10, which `-Dboot.version=3.2.12` turns on automatically.
 
+The first CI runs of the matrix caught two more things the macOS runs never showed, both pool
+ordering: a test that returned a Hikari connection with a dirty `search_path`, and one that
+returned it with autocommit off; Hikari repairs both on return, tomcat-jdbc does not, and the next
+observer install then blocked on `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` for the job's whole 30
+minutes. The installer now runs its DDL under a `lock_timeout` and, on timeout, names the sessions
+holding locks (pid, state, last query) instead of hanging.
+
 What the matrix found and fixed: with a pool **statement cache** on (tomcat-jdbc, DBCP2, c3p0,
 vibur) a cached `PreparedStatement` handed the next borrower the previous borrower's warning chain,
 so rows were counted twice and tenant A's own read was charged to tenant B; DBCP2's `ResultSet`

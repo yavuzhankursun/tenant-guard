@@ -210,11 +210,66 @@ Two silent under-reporting bugs were found by these tests and fixed:
 
 ## Endpoint scanning
 
-(filled in after the scanner lands)
+The HTTP layer drives every `GET` endpoint of the app as the attacker (B) against the victim's
+(A) data, with the observer and the differential probe underneath. Endpoints are discovered from
+Spring's `RequestMappingHandlerMapping`: no OpenAPI file, no token list.
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+@TenantIsolationTest(tenantColumn = "tenant_id")
+class EndpointIsolationIT {
+
+    @Test
+    void tenantsCannotSeeEachOther(TenantGuard guard, @Autowired MockMvc mockMvc,
+                                   @Autowired ApplicationContext context, @Autowired DataSource dataSource) {
+        EndpointScanner.builder(mockMvc, guard)
+                .endpoints(EndpointDiscovery.discover(context))
+                .seeder(tenant -> /* insert that tenant's rows, as the owner */)
+                .authenticator(tenant -> request -> { request.addHeader("X-Tenant", tenant); return request; })
+                .resourceIds(ResourceIds.builder()
+                        .id("/invoices/{invoiceId}/lines/{lineId}", "lineId", tenant -> /* override */)
+                        .fallback(new TableGuessingResourceIds(dataSource, "tenant_id"))
+                        .build())
+                .build()
+                .scan()
+                .assertNoLeaks();
+    }
+}
+```
+
+The scan runs in phases: seed B → record a baseline of every endpoint without path variables as B
+(twice, to mask fields that change on every call) → seed A → call every endpoint as B, with A's
+ids substituted into `{id}`-style variables. Verdicts:
+
+| Verdict   | Meaning                                                                                   |
+|-----------|-------------------------------------------------------------------------------------------|
+| `LEAK`    | 2xx on an endpoint called with A's id, or the response changed after A's data was added    |
+| `SUSPECT` | Response unchanged / 403 / 404, but the observer saw A's rows being read during the call   |
+| `CLEAN`   | Neither                                                                                   |
+| `SKIPPED` | Id could not be resolved (reason in the note), or 401: the authenticator is probably wrong |
+| `ERROR`   | 5xx or handler exception. Fails `assertNoLeaks()`: a crash is not proof of safety          |
+
+`assertNoLeaks()` prints a table like this one from the sample app:
+
+```
+Tenant isolation scan: 3 of 5 GET endpoint(s) failed for tenant B against tenant A's data (3 LEAK)
+  VERDICT  ENDPOINT           STATUS NOTE
+  LEAK     GET /invoices      200    response changed after tenant A's data was added: $.size, $[2].amount, ...
+  LEAK     GET /invoices/{id} 200    200 for tenant A's /invoices/3; observer: invoice rows of tenant A read by select ... where i1_0.id=?
+  LEAK     GET /reports/total 200    response changed after tenant A's data was added: $.total; observer: ...
+```
+
+`{id}` → table mapping guesses the table from the preceding path segment and the variable name
+(`/invoices/{id}` → `invoice`, `{invoiceLineId}` → `invoice_line`), validates every identifier
+before it reaches SQL, and reports `SKIPPED` with the names it tried when nothing matches.
+Nested ids are resolved independently, so `/invoices/{a}/lines/{b}` usually needs an override.
+Only `GET` is scanned; query parameters, pagination and request bodies are not generated.
+Calls are sequential because the guard's actor is global.
 
 ## Roadmap
 
-- HTTP endpoint scanner: drive every endpoint as B with the differential mode.
+- POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
 - RESTRICTIVE observer policy for tables that already use RLS.
 - Write-side observation (`INSERT`/`UPDATE` into another tenant).
 - Per-session NOTICE nonce instead of the fixed `tg|` prefix.

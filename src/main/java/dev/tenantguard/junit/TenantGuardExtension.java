@@ -63,7 +63,8 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                 seeder.seed(settings.victim());
                 seeder.seed(settings.attacker());
             });
-            TableDiscovery.Result tables = install(dataSource, settings.tenantColumn(), settings.tables());
+            TableDiscovery.Result tables = install(dataSource, settings.tenantColumn(), settings.tables(),
+                    settings.schemas());
             guard.activate();
             if (settings.selfCheck()) {
                 selfCheck(dataSource, guard);
@@ -121,15 +122,22 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
      * uses the app's own credentials, which own the tables when the schema comes from Flyway.
      */
     static TableDiscovery.Result install(DataSource dataSource, String column, String[] explicitTables) {
+        return install(dataSource, column, explicitTables, new String[0]);
+    }
+
+    /** @param schemas where discovery looks, empty for the connection's search_path; unused for explicit tables */
+    static TableDiscovery.Result install(DataSource dataSource, String column, String[] explicitTables,
+                                         String[] schemas) {
         try (Connection owner = dataSource.getConnection()) {
             TableDiscovery.Result tables = explicitTables.length > 0
                     ? new TableDiscovery.Result(List.of(explicitTables), Map.of())
-                    : TableDiscovery.discover(owner, column);
+                    : TableDiscovery.discover(owner, column, List.of(schemas));
             tables.skipped().forEach((table, reason) ->
                     LOG.log(System.Logger.Level.WARNING, "TenantGuard does not observe table ''{0}'': {1}", table, reason));
             if (tables.tables().isEmpty()) {
-                throw new IllegalStateException(("TenantGuard is blind: no observable table in the current schema "
-                        + "has column '%s' (skipped: %s)").formatted(column, tables.skipped()));
+                String where = schemas.length == 0 ? "the search_path's schemas" : "schemas " + List.of(schemas);
+                throw new IllegalStateException("TenantGuard is blind: no observable table in %s has column '%s' (skipped: %s)"
+                        .formatted(where, column, tables.skipped()));
             }
             installAs(owner, column, tables.tables());
             return tables;

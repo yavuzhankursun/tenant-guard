@@ -21,10 +21,13 @@ import javax.sql.DataSource;
  */
 public final class TableGuessingResourceIds implements ResourceIds {
 
-    private static final String TABLE_EXISTS = "SELECT 1 FROM information_schema.tables "
-            + "WHERE table_schema = current_schema() AND table_name = ?";
-    private static final String COLUMNS = "SELECT column_name FROM information_schema.columns "
-            + "WHERE table_schema = current_schema() AND table_name = ?";
+    /*
+     * Resolved like the lookup query's own bare table name: through the search_path, first match wins.
+     * current_schema() alone missed every table in the second path entry (search_path = tenancy, public).
+     */
+    private static final String TABLE_EXISTS = "SELECT 1 WHERE to_regclass(?) IS NOT NULL";
+    private static final String COLUMNS = "SELECT attname FROM pg_attribute "
+            + "WHERE attrelid = to_regclass(?) AND attnum > 0 AND NOT attisdropped";
 
     private final DataSource dataSource;
     private final String tenantColumn;
@@ -75,7 +78,7 @@ public final class TableGuessingResourceIds implements ResourceIds {
 
     private static boolean tableExists(Connection connection, String table) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(TABLE_EXISTS)) {
-            statement.setString(1, table);
+            statement.setString(1, SqlIdentifiers.quote(table));
             try (ResultSet rs = statement.executeQuery()) {
                 return rs.next();
             }
@@ -85,7 +88,7 @@ public final class TableGuessingResourceIds implements ResourceIds {
     private static Set<String> columns(Connection connection, String table) throws SQLException {
         Set<String> columns = new LinkedHashSet<>();
         try (PreparedStatement statement = connection.prepareStatement(COLUMNS)) {
-            statement.setString(1, table);
+            statement.setString(1, SqlIdentifiers.quote(table));
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
                     columns.add(rs.getString(1));

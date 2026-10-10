@@ -17,7 +17,7 @@ import java.util.function.Supplier;
 public final class TenantGuard {
 
     /** Where in the JDBC call sequence a notice was collected; tells us whether the ORM got there first. */
-    public enum HarvestPoint { EXECUTE, CLEAR_WARNINGS, CLOSE }
+    public enum HarvestPoint { EXECUTE, CLEAR_WARNINGS, CLOSE, FETCH }
 
     private final AtomicBoolean active = new AtomicBoolean(false);
     private final AtomicReference<String> actor = new AtomicReference<>();

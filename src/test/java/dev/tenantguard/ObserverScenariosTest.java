@@ -163,6 +163,39 @@ class ObserverScenariosTest extends GuardedTestBase {
         assertThat(guard.findings(Rule.ACTOR_MISMATCH)).hasSize(2);
     }
 
+    @Test
+    @DisplayName("fetchSize=1 cursor: ilk partiden sonra gelen yabancı satırlar da toplanır")
+    void rowsFetchedAfterFirstBatchAreObserved() throws Exception {
+        // Seed order is A then B and the query has no sort, so with actor A the foreign (B) rows are
+        // scanned only when later batches are fetched.
+        int rows = guard.callAs(TENANT_A, () -> {
+            try (Connection connection = dataSource.getConnection()) {
+                connection.setAutoCommit(false);
+                try (java.sql.PreparedStatement ps = connection.prepareStatement("SELECT id FROM invoice")) {
+                    ps.setFetchSize(1);
+                    int count = 0;
+                    try (java.sql.ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            count++;
+                        }
+                    }
+                    connection.rollback();
+                    return count;
+                }
+            } catch (java.sql.SQLException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+
+        report("harvestedRows", guard.harvestedRows().toString());
+        assertThat(rows).isEqualTo(4);
+        assertThat(guard.harvestedRows()).as("foreign rows really arrived after the first batch")
+                .containsKey(TenantGuard.HarvestPoint.FETCH);
+        assertThat(guard.findings(Rule.ACTOR_MISMATCH))
+                .flatExtracting(Finding::tenants)
+                .contains(TENANT_B);
+    }
+
     /** Experiment output: plans and harvest points are the answers we are after, not just green/red. */
     private static void report(String key, String value) {
         System.out.printf("[scenario] %s:%n%s%n", key, value);

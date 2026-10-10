@@ -76,6 +76,8 @@ class SchemaShapesTest extends ShapesTestBase {
 
     @Test
     void selfCheckFindsTheProbeEvenWhenItIsNotOnTheConnectionsSearchPath() throws SQLException {
+        // The connection is pooled: restore the app's search_path on close, or the next borrower
+        // (another test's observer install) would see public.t_in_schema unshadowed and label it bare.
         DataSource publicOnly = new DelegatingDataSource(dataSource) {
             @Override
             public Connection getConnection() throws SQLException {
@@ -83,7 +85,20 @@ class SchemaShapesTest extends ShapesTestBase {
                 try (Statement setup = connection.createStatement()) {
                     setup.execute("SET search_path TO public");
                 }
-                return connection;
+                return (Connection) java.lang.reflect.Proxy.newProxyInstance(
+                        Connection.class.getClassLoader(), new Class<?>[] {Connection.class},
+                        (proxy, method, args) -> {
+                            if ("close".equals(method.getName())) {
+                                try (Statement restore = connection.createStatement()) {
+                                    restore.execute("SET search_path TO " + SEARCH_PATH);
+                                }
+                            }
+                            try {
+                                return method.invoke(connection, args);
+                            } catch (java.lang.reflect.InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
             }
         };
 

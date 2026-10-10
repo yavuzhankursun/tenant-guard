@@ -197,7 +197,28 @@ tomcat-jdbc does not, and an observer install blocked on a table lock for the jo
 The installer now uses a `lock_timeout` and reports the lock holders; a hang is the one failure
 mode worse than a wrong answer.
 
-## 12. Things deliberately kept simple
+## 12. Writes, and a nonce
+
+Reading was only half of the IDOR story: a real application updated another tenant's stock row
+through a `PUT` whose repository method lacked the tenant predicate. Two additions cover writes.
+
+- **Observation.** The policy's `WITH CHECK` now calls `tg_observe_write`, so an INSERT or UPDATE
+  that leaves a row with another tenant's id is reported as `WRITE_MISMATCH`. An UPDATE of a
+  foreign row is also a read (Postgres evaluates USING on the old row), so it yields both findings.
+  A DELETE leaves no new row and is seen only as a read.
+- **Scanning.** For write endpoints the HTTP status says little (a leaky PUT answers 200, a correct
+  one 404, a broken one 400), so the verdict comes from the data: snapshot every victim row before
+  and after the call. Isolation is by re-seeding after every call that changed data, not by a
+  rollback, because MockMvc requests run in the application's own transactions on pooled
+  connections. DELETEs run last.
+
+The notice format also gained a per-install nonce. Before, any `RAISE NOTICE 'tg|...'` from the
+application, or a tenant-controlled string it happened to raise, was parsed as an observation and
+could forge or hide findings. Now each install bakes 16 random bytes into the functions and the
+guard trusts only that nonce for that database. It is visible in `pg_proc`, so it defends against
+strings, not against code that can run arbitrary SQL in the test database.
+
+## 13. Things deliberately kept simple
 
 - The actor is a global, not a `ThreadLocal`: the scanner issues one request at a time, and a
   global survives `@Async` and thread pools. Cost: no parallel test execution.

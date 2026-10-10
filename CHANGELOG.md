@@ -10,6 +10,9 @@ version may change the public API.
 
 ### Changed
 
+- `ObserverInstaller.install(...)` returns an `Installation`; callers that install directly must
+  `guard.trust(installation)`. `RowRead` and `Observation` gained a kind / written-tenants
+  component (old constructors kept).
 - **Maven coordinates are now `io.github.yavuzhankursun:tenant-guard`** (were `dev.tenantguard:tenant-guard`),
   the namespace Maven Central verifies through the GitHub account. The Java packages stay
   `dev.tenantguard.*`; only the dependency declaration changes.
@@ -22,6 +25,16 @@ version may change the public API.
 
 ### Added
 
+- **Write endpoint scanning** (POST, PUT, PATCH, DELETE), opt-in via
+  `EndpointScanner.includeWrites(dataSource, tenantColumn)`: a write is a LEAK when the victim's rows
+  change across the call (row snapshots), whatever the HTTP status; request bodies are user-supplied
+  or generated from the `@RequestBody` type; optional spoof probe for tenant fields in POST bodies.
+- **Write-side observation**: the observer policy's `WITH CHECK` reports INSERTs and UPDATEs that
+  leave a row with another tenant's id as `Finding.Rule.WRITE_MISMATCH`.
+- **Per-install NOTICE nonce** (`tg:<nonce>|r|table|tenant`): the application's own notices and
+  forged strings can no longer produce observations.
+- `ALTER DEFAULT PRIVILEGES` for the observed role, so tables created after installation do not fail
+  with "permission denied" while the guard is active (they are not observed).
 - Tables that already have RLS policies are observed instead of skipped or refused: the observer is
   created `AS RESTRICTIVE` there, so the application's own policy keeps filtering (a permissive one
   would be OR-ed with it). Tables whose policies never grant the observed role anything are refused.

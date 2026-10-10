@@ -37,8 +37,10 @@ observed table, a permissive policy for that role only:
 
 ```sql
 CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
-  USING (tg_observe('invoice', tenant_id::text)) WITH CHECK (true);
--- tg_observe(): RAISE NOTICE 'tg|%|%', tbl, row_tenant; RETURN true;
+  USING (tg_observe('invoice', tenant_id::text))
+  WITH CHECK (tg_observe_write('invoice', tenant_id::text));
+-- tg_observe():       RAISE NOTICE 'tg:<nonce>|r|%|%', tbl, row_tenant; RETURN true;
+-- tg_observe_write(): RAISE NOTICE 'tg:<nonce>|w|%|%', tbl, row_tenant; RETURN true;
 ```
 
 The policy never filters anything. It only reports. `FORCE ROW LEVEL SECURITY` is not set, so
@@ -56,7 +58,7 @@ The path of one NOTICE, for tenant B running an unfiltered query:
     |                   |------------------>|------- query --------->|                      |
     |                   |                   |                        | read row A-1         |
     |                   |                   |                        | policy: tg_observe() |
-    |                   |                   |<-- NOTICE tg|invoice|A |                      |
+    |                   |                   |<-- NOTICE tg:…|r|invoice|A                   |
     |                   |                   |   (SQLWarning chain)   |                      |
     |                   |<-- ResultSet -----|                        |                      |
     |                   | harvest #2 (after execute) ------------------------------------->| RowRead(invoice, A)
@@ -98,6 +100,25 @@ collations. Seed A with both. Then `MAX`, `MIN` and `ORDER BY ... LIMIT 1` chang
 leaks.
 
 ## Quick start
+
+Add the test dependency (the coordinates are `io.github.yavuzhankursun:tenant-guard`; until the
+first Maven Central release, build it with `mvn install` from this repository):
+
+```xml
+<dependency>
+    <groupId>io.github.yavuzhankursun</groupId>
+    <artifactId>tenant-guard</artifactId>
+    <version>0.2.0-SNAPSHOT</version>
+    <scope>test</scope>
+</dependency>
+```
+
+```kotlin
+testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0-SNAPSHOT") // Gradle Kotlin DSL
+```
+
+The library brings no transitive dependencies; Spring, JUnit and Jackson come from your project.
+A Kotlin + Gradle consumer lives in [examples/gradle-kotlin-consumer](examples/gradle-kotlin-consumer).
 
 ```java
 @SpringBootTest
@@ -267,13 +288,19 @@ Five silent under-reporting bugs were found by these tests and fixed:
   again. Clear the `CacheManager` after seeding the victim.
 - **`@Scheduled` jobs run under the global actor.** The extension warns when scheduling is
   enabled; `tenantguard.scheduling=off` installs a `TaskScheduler` that runs nothing.
-- **The `tg|` NOTICE prefix is spoofable** by the application's own `RAISE NOTICE`.
+- **The NOTICE prefix carries a per-install nonce** (`tg:<nonce>|...`, 16 random bytes), so the
+  application's own `RAISE NOTICE 'tg|...'` or a tenant-controlled string it raises is ignored. The
+  nonce is readable in `pg_proc` by any role, so it stops forged strings, not code that runs
+  arbitrary SQL against the test database.
 - **One NOTICE per row read.** Large seeds and full scans are slow. Seed a handful of rows.
-- **`GRANT ... ON ALL TABLES` covers existing tables only.** Tables created after installation
-  are not granted to `tg_app`.
+- **Tables created after installation** are granted to `tg_app` through `ALTER DEFAULT
+  PRIVILEGES`, so the app can use them while the guard is active, but they carry no observer
+  policy and are not observed until the next install.
 - **Driver-specific `unwrap`** (e.g. to `PGConnection`) returns the raw connection, and
   statements created from it bypass the proxy.
-- The write side (`WITH CHECK`) is not observed.
+- **Writes** are observed through the policy's `WITH CHECK`: an INSERT or UPDATE that leaves a row
+  with another tenant's id is `WRITE_MISMATCH`. A DELETE writes no new row and is seen as a read.
+  On tables with their own RLS policy, Postgres rejects a foreign insert before the observer.
 
 ## Endpoint scanning
 
@@ -341,17 +368,44 @@ Tenant isolation scan: 3 of 5 GET endpoint(s) failed for tenant B against tenant
 (`/invoices/{id}` → `invoice`, `{invoiceLineId}` → `invoice_line`), validates every identifier
 before it reaches SQL, and reports `SKIPPED` with the names it tried when nothing matches.
 Nested ids are resolved independently, so `/invoices/{a}/lines/{b}` usually needs an override.
-Only `GET` is scanned; query parameters, pagination and request bodies are not generated.
+Query parameters and pagination are not generated.
 Calls are sequential because the guard's actor is global.
+
+### Write endpoints (POST, PUT, PATCH, DELETE)
+
+Writes mutate data, so they are opt-in:
+
+```java
+EndpointScanner.builder(mockMvc, guard)
+        .endpoints(EndpointDiscovery.discover(context))
+        .endpoints(EndpointDiscovery.discoverWrites(context))
+        .includeWrites(dataSource, "tenant_id")
+        .body("PUT /invoices/{id}", tenant -> "{\"amount\": 1}")   // optional; otherwise generated
+        .spoofTenantField()                                          // optional: send A's id in tenantId-like fields
+        ...
+```
+
+A write is judged by the victim's data, not by the HTTP status: before each call the scanner
+snapshots every row of the victim in every table with the tenant column, calls the endpoint as B
+with A's ids, and snapshots again. A row of A updated, deleted or created is a LEAK
+(`invoice: 1 row updated`, `invoice_line: 2 rows deleted`, `spoofed tenantId=A: invoice: 1 row
+created with tenant A`). No change is CLEAN, or SUSPECT when the observer still saw A's rows; 5xx
+is ERROR; a 400/415/422 to a generated body is SKIPPED (the body never reached the data). Request
+bodies are generated from the handler's `@RequestBody` type through Jackson (strings, numbers,
+enums, one level of nesting); types it cannot build are SKIPPED with a reason, and `.body(...)`
+supplies them. After every call that changed data both tenants are re-seeded with your
+`TenantSeeder`; DELETEs run last. The cost is two full snapshots per write call, so seed small.
+Ids inside request bodies are not replaced with A's, and CSRF-protected endpoints need the token
+in your authenticator, or their 403 looks like a correct rejection.
 
 ## How this is verified
 
-- **503 tests** against Postgres in Testcontainers, on every push (GitHub Actions); the
+- **584 tests** against Postgres in Testcontainers, on every push (GitHub Actions); the
   environment matrix below on every push to `main` and nightly.
 - **33-path JDBC access matrix** (`JdbcPathMatrixTest`): the same leak through every Statement,
   PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate and `unwrap` path.
 - **33-pattern leak corpus** (above), every blind spot with a mechanism test.
-- **Mutation testing** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, PIT with the
+- **Mutation testing** (`mvn -Pmutation test-compile org.pitest:pitest-maven:mutationCoverage`, PIT with the
   STRONGER mutators on the JDBC core): 97% of 226 mutants killed; the survivors are equivalent
   (void returns, proxy argument shapes). A broken harvest cannot stay green.
 - **Spring Data's official `@TenantId` example** on Postgres
@@ -403,13 +457,11 @@ result with its own `InternalError`, guard or no guard.
 
 ## Roadmap
 
-- Gradle and Kotlin consumers.
 - Runs against open-source multi-tenant Spring projects.
 - Warn about views without `security_invoker` and `SECURITY DEFINER` functions at install time.
-- POST/PUT/DELETE scanning with generated bodies; DELETE last with re-seeding.
-- Write-side observation (`INSERT`/`UPDATE` into another tenant).
-- Per-session NOTICE nonce instead of the fixed `tg|` prefix.
-- `ALTER DEFAULT PRIVILEGES` for tables created after installation.
+- First release to Maven Central (see [docs/RELEASING.md](docs/RELEASING.md)).
+- Write scanning: replace ids inside request bodies with the victim's; spoof probes on PUT/PATCH.
+- An owner probe that tells a CSRF 403 from a real authorization rejection.
 
 ## Related tools
 

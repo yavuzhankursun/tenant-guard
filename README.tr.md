@@ -39,8 +39,10 @@ tabloda yalnızca bu role uygulanan permissive bir politika oluşturur:
 
 ```sql
 CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
-  USING (tg_observe('invoice', tenant_id::text)) WITH CHECK (true);
--- tg_observe(): RAISE NOTICE 'tg|%|%', tbl, row_tenant; RETURN true;
+  USING (tg_observe('invoice', tenant_id::text))
+  WITH CHECK (tg_observe_write('invoice', tenant_id::text));
+-- tg_observe():       RAISE NOTICE 'tg:<nonce>|r|%|%', tbl, row_tenant; RETURN true;
+-- tg_observe_write(): RAISE NOTICE 'tg:<nonce>|w|%|%', tbl, row_tenant; RETURN true;
 ```
 
 Politika hiçbir şeyi filtrelemez, yalnızca raporlar. `FORCE ROW LEVEL SECURITY` ayarlanmaz; bu
@@ -58,7 +60,7 @@ Kiracı B filtresiz bir sorgu çalıştırdığında tek bir NOTICE'in izlediği
     |                   |------------------>|------- sorgu --------->|                      |
     |                   |                   |                        | A-1 satırı okundu    |
     |                   |                   |                        | politika: tg_observe()|
-    |                   |                   |<-- NOTICE tg|invoice|A |                      |
+    |                   |                   |<-- NOTICE tg:…|r|invoice|A                   |
     |                   |                   |   (SQLWarning zinciri) |                      |
     |                   |<-- ResultSet -----|                        |                      |
     |                   | toplama #2 (execute sonrası) ----------------------------------->| RowRead(invoice, A)
@@ -99,6 +101,25 @@ tutar `0.01` / `999999999.99` (`numeric(12,2)`'ye sığar), zaman ve tarih `1970
 seed edin. O zaman `MAX`, `MIN` ve `ORDER BY ... LIMIT 1` A sızar sızmaz değişir.
 
 ## Hızlı başlangıç
+
+Test bağımlılığını ekleyin (koordinat `io.github.yavuzhankursun:tenant-guard`; ilk Maven Central
+sürümüne kadar bu repoda `mvn install` ile kurun):
+
+```xml
+<dependency>
+    <groupId>io.github.yavuzhankursun</groupId>
+    <artifactId>tenant-guard</artifactId>
+    <version>0.2.0-SNAPSHOT</version>
+    <scope>test</scope>
+</dependency>
+```
+
+```kotlin
+testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0-SNAPSHOT") // Gradle Kotlin DSL
+```
+
+Kütüphane geçişli bağımlılık getirmez; Spring, JUnit ve Jackson sizin projenizden gelir. Kotlin +
+Gradle örneği: [examples/gradle-kotlin-consumer](examples/gradle-kotlin-consumer).
 
 ```java
 @SpringBootTest
@@ -271,15 +292,20 @@ Bu testler beş "sessiz eksik raporlama" hatası buldu; hepsi düzeltildi:
   ulaşmaz. Kurbanı seed ettikten sonra `CacheManager`'ı temizleyin.
 - **`@Scheduled` işler global aktör altında çalışır.** Scheduling açıksa eklenti uyarır;
   `tenantguard.scheduling=off` hiçbir işi çalıştırmayan bir `TaskScheduler` kurar.
-- **`tg|` NOTICE öneki taklit edilebilir:** uygulamanın kendi `RAISE NOTICE`'i aynı öneki
-  kullanırsa yanlış bulgu üretir.
+- **NOTICE öneki kurulum başına bir nonce taşır** (`tg:<nonce>|...`, 16 rastgele bayt); uygulamanın
+  kendi `RAISE NOTICE 'tg|...'`'i ya da kiracının kontrol ettiği bir metin yok sayılır. Nonce
+  `pg_proc`'ta her rol tarafından okunabilir; sahte metinleri durdurur, test veritabanında keyfi SQL
+  çalıştıran kodu değil.
 - **Okunan satır başına bir NOTICE.** Büyük seed'ler ve tam taramalar yavaştır. Bir avuç satır
   seed edin.
-- **`GRANT ... ON ALL TABLES` yalnızca mevcut tabloları kapsar.** Kurulumdan sonra oluşturulan
-  tablolar `tg_app`'e verilmez.
+- **Kurulumdan sonra oluşturulan tablolar** `ALTER DEFAULT PRIVILEGES` ile `tg_app`'e verilir;
+  guard aktifken uygulama bunları kullanabilir, ama gözlemci politikaları yoktur ve bir sonraki
+  kuruluma kadar gözlenmezler.
 - **Sürücüye özgü `unwrap`** (ör. `PGConnection`) ham bağlantıyı döndürür; oradan açılan
   statement'lar proxy'yi atlar.
-- Yazma tarafı (`WITH CHECK`) gözlenmez.
+- **Yazmalar** politikanın `WITH CHECK`'i ile gözlenir: başka kiracının id'siyle satır bırakan bir
+  INSERT ya da UPDATE `WRITE_MISMATCH` olur. DELETE yeni satır yazmaz, okuma olarak görünür. Kendi
+  RLS politikası olan tablolarda Postgres yabancı bir INSERT'i gözlemciden önce reddeder.
 
 ## Endpoint taraması
 
@@ -346,13 +372,40 @@ Tenant isolation scan: 3 of 5 GET endpoint(s) failed for tenant B against tenant
 `{id}` → tablo eşlemesi, tabloyu önceki path parçasından ve değişken adından tahmin eder
 (`/invoices/{id}` → `invoice`, `{invoiceLineId}` → `invoice_line`), her identifier'ı SQL'e
 ulaşmadan doğrular ve hiçbiri eşleşmezse denediği isimlerle birlikte `SKIPPED` raporlar. İç içe
-id'ler bağımsız çözülür; `/invoices/{a}/lines/{b}` genellikle override ister. Yalnızca `GET`
-taranır; query parametresi, pagination ve istek gövdesi üretilmez. Guard'ın aktörü global olduğu
-için çağrılar sıralıdır.
+id'ler bağımsız çözülür; `/invoices/{a}/lines/{b}` genellikle override ister. Query parametresi
+ve pagination üretilmez.
+Guard'ın aktörü global olduğu için çağrılar sıralıdır.
+
+### Yazma endpoint'leri (POST, PUT, PATCH, DELETE)
+
+Yazmalar veriyi değiştirdiği için isteğe bağlıdır:
+
+```java
+EndpointScanner.builder(mockMvc, guard)
+        .endpoints(EndpointDiscovery.discover(context))
+        .endpoints(EndpointDiscovery.discoverWrites(context))
+        .includeWrites(dataSource, "tenant_id")
+        .body("PUT /invoices/{id}", tenant -> "{\"amount\": 1}")   // isteğe bağlı; yoksa üretilir
+        .spoofTenantField()                                          // isteğe bağlı: tenantId benzeri alanlara A'nın id'si
+        ...
+```
+
+Bir yazma HTTP durumuna göre değil kurbanın verisine göre değerlendirilir: her çağrıdan önce
+tarayıcı, tenant kolonu olan her tablodaki kurbanın bütün satırlarının fotoğrafını çeker, endpoint'i
+A'nın id'leriyle B olarak çağırır ve fotoğrafı tekrar çeker. A'nın bir satırı güncellendiyse,
+silindiyse ya da A adına oluşturulduysa LEAK'tir (`invoice: 1 row updated`, `invoice_line: 2 rows
+deleted`, `spoofed tenantId=A: invoice: 1 row created with tenant A`). Değişiklik yoksa CLEAN,
+gözlemci yine de A'nın satırlarını gördüyse SUSPECT; 5xx ERROR; üretilen gövdeye 400/415/422
+SKIPPED (gövde veriye hiç ulaşmadı). Gövdeler handler'ın `@RequestBody` tipinden Jackson ile
+üretilir; üretilemeyen tipler gerekçesiyle SKIPPED olur ve `.body(...)` ile verilir. Veriyi
+değiştiren her çağrıdan sonra iki kiracı `TenantSeeder`'ınızla yeniden seed edilir; DELETE'ler en
+sona kalır. Maliyet yazma çağrısı başına iki tam fotoğraf; seed'i küçük tutun. Gövde içindeki
+id'ler A'nınkiyle değiştirilmez; CSRF korumalı endpoint'lerde token'ı authenticator'a ekleyin,
+yoksa 403 doğru bir red gibi görünür.
 
 ## Nasıl doğrulanıyor
 
-- Her push'ta Testcontainers Postgres üzerinde **503 test** (GitHub Actions); aşağıdaki ortam
+- Her push'ta Testcontainers Postgres üzerinde **584 test** (GitHub Actions); aşağıdaki ortam
   matrisi `main`'e her push'ta ve her gece.
 - **33 yollu JDBC erişim matrisi** (`JdbcPathMatrixTest`): aynı sızıntı Statement,
   PreparedStatement, batch, callable, cursor, JdbcTemplate, Hibernate ve `unwrap` yollarının her
@@ -410,13 +463,11 @@ taşır (bulgular fetch partisi başına bölünür, satır sayıları tam kalı
 
 ## Yol haritası
 
-- Gradle ve Kotlin tüketicileri.
 - Açık kaynak çok kiracılı Spring projelerinde koşular.
 - Kurulumda `security_invoker` olmayan view'lar ve `SECURITY DEFINER` fonksiyonlar için uyarı.
-- Üretilmiş gövdelerle POST/PUT/DELETE taraması; DELETE en sona, sonrasında yeniden seed.
-- Yazma tarafının gözlenmesi (başka kiracıya `INSERT`/`UPDATE`).
-- Sabit `tg|` öneki yerine oturum başına NOTICE nonce'u.
-- Kurulumdan sonra oluşturulan tablolar için `ALTER DEFAULT PRIVILEGES`.
+- Maven Central'a ilk sürüm ([docs/RELEASING.md](docs/RELEASING.md)).
+- Yazma taraması: gövde içindeki id'leri kurbanınkiyle değiştirmek; PUT/PATCH'te spoof denemesi.
+- CSRF 403'ünü gerçek yetki reddinden ayıran bir sahip denemesi.
 
 ## Benzer araçlar
 

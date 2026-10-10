@@ -16,6 +16,7 @@ class TableDiscoveryTest extends GuardedTestBase {
             try (Statement ddl = owner.createStatement()) {
                 ddl.execute("CREATE VIEW invoice_view AS SELECT * FROM invoice");
                 ddl.execute("CREATE TABLE \"MixedCase\" (tenant_id text)");
+                ddl.execute("CREATE TABLE \"odd name\" (tenant_id text)");
                 ddl.execute("CREATE TABLE no_tenant (id int)");
                 ddl.execute("CREATE TABLE locked (tenant_id text)");
                 ddl.execute("ALTER TABLE locked ENABLE ROW LEVEL SECURITY");
@@ -24,10 +25,11 @@ class TableDiscoveryTest extends GuardedTestBase {
                 TableDiscovery.Result result = TableDiscovery.discover(owner, "tenant_id");
 
                 // legacy_doc has its own permissive policy: observed with a RESTRICTIVE observer, not skipped.
-                assertThat(result.tables()).containsExactly("invoice", "invoice_line", "legacy_doc");
-                assertThat(result.skipped()).containsOnlyKeys("MixedCase", "locked");
+                // Quoted identifiers are observed now; only names outside the allowlist are skipped.
+                assertThat(result.tables()).containsExactly("MixedCase", "invoice", "invoice_line", "legacy_doc");
+                assertThat(result.skipped()).containsOnlyKeys("odd name", "locked");
                 assertThat(result.skipped().get("locked")).contains("none is permissive for role 'tg_app'");
-                assertThat(result.skipped().get("MixedCase")).contains("unsupported identifier");
+                assertThat(result.skipped().get("odd name")).contains("unsupported identifier");
             } finally {
                 owner.rollback();
             }

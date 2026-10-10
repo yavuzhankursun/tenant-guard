@@ -6,9 +6,12 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Installs the observer: a non-owner, non-bypass role and a policy that always returns true but
@@ -20,23 +23,45 @@ import java.util.Map;
  * {@code AS RESTRICTIVE}: Postgres ORs permissive policies, so a permissive always-true observer
  * would switch the app's isolation off, while a restrictive one is AND-ed and leaves it intact.
  * Rows the app's policy rejects are then never observed, which is right: they did not leak.
+ *
+ * <p>Location: {@code tg_observe} and {@code tg_probe} go into the installing connection's current
+ * schema (the first existing schema on its search_path, where an unqualified CREATE would go), and
+ * every policy calls the function schema-qualified, so a table in any schema can be observed. The
+ * observed role gets USAGE and table privileges on the search_path's schemas and on every schema
+ * holding an observed table, not on a hard-coded {@code public}: with {@code search_path = tenancy}
+ * a public-only grant hid the probe itself ("relation tg_probe does not exist").
+ *
+ * <p>Every app-chosen name (table, schema, tenant column) is resolved against the catalog and
+ * double-quoted, so mixed-case and reserved-word names work; see {@link Identifiers#quote}.
+ *
+ * <p>Tenant values: the policy reports {@code tenant_column::text}, Postgres' canonical text form
+ * ({@code 2} for integers, lower-case dashed uuids). Actors are compared with it exactly; see
+ * {@link TenantGuard#callAs}.
  */
 public final class ObserverInstaller {
 
     public static final String ROLE = "tg_app";
     public static final String PROBE_TABLE = "tg_probe";
     static final String POLICY = "tg_observer";
+    static final String FUNCTION = "tg_observe";
 
     private ObserverInstaller() {
     }
 
+    /**
+     * @param tables {@code table} or {@code schema.table}, case-sensitive as in the catalog; bare names
+     *               resolve through the owner connection's search_path
+     */
     public static void install(Connection owner, String tenantColumn, List<String> tables) throws SQLException {
-        String column = Identifiers.require(tenantColumn);
-        List<String> observed = tables.stream().map(Identifiers::require).toList();
-        Map<String, Boolean> restrictive = new LinkedHashMap<>();
-        for (String table : observed) {
-            restrictive.put(table, policyKind(owner, table) == PolicyKind.RESTRICTIVE);
+        String column = Identifiers.quote(tenantColumn);
+        String home = Identifiers.quote(currentSchema(owner));
+        Map<ObservedTable, Boolean> restrictive = new LinkedHashMap<>();
+        for (String table : tables) {
+            ObservedTable observed = ObservedTable.resolve(owner, table);
+            restrictive.put(observed, policyKind(owner, observed) == PolicyKind.RESTRICTIVE);
         }
+        String probe = home + "." + Identifiers.quote(PROBE_TABLE);
+        String observe = home + "." + Identifiers.quote(FUNCTION);
 
         List<String> ddl = new ArrayList<>(List.of(
                 """
@@ -47,20 +72,26 @@ public final class ObserverInstaller {
                 END $$""".formatted(ROLE),
                 "GRANT " + ROLE + " TO CURRENT_USER",
                 """
-                CREATE OR REPLACE FUNCTION tg_observe(tbl text, row_tenant text) RETURNS boolean
+                CREATE OR REPLACE FUNCTION %s(tbl text, row_tenant text) RETURNS boolean
                 LANGUAGE plpgsql VOLATILE AS $$
                 BEGIN
-                  RAISE NOTICE 'tg|%|%', tbl, row_tenant;
+                  RAISE NOTICE 'tg|%%|%%', tbl, row_tenant;
                   RETURN true;
-                END $$""",
-                "CREATE TABLE IF NOT EXISTS %s (%s text NOT NULL)".formatted(PROBE_TABLE, column),
-                "INSERT INTO %1$s (%2$s) SELECT 'tg-probe' WHERE NOT EXISTS (SELECT 1 FROM %1$s)"
-                        .formatted(PROBE_TABLE, column),
-                "GRANT USAGE ON SCHEMA public TO " + ROLE,
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO " + ROLE,
-                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO " + ROLE));
-        restrictive.forEach((table, asRestrictive) -> ddl.addAll(policyDdl(table, column, asRestrictive)));
-        ddl.addAll(policyDdl(PROBE_TABLE, column, false));
+                END $$""".formatted(observe),
+                // The probe's policy does not read its column: a probe left behind by an install with
+                // another tenant column (company_id, then tenant_id) must keep working.
+                "CREATE TABLE IF NOT EXISTS %s (tenant text NOT NULL)".formatted(probe),
+                "INSERT INTO %1$s SELECT 'tg-probe' WHERE NOT EXISTS (SELECT 1 FROM %1$s)".formatted(probe)));
+        for (String schema : grantedSchemas(owner, restrictive.keySet())) {
+            String quoted = Identifiers.quote(schema);
+            ddl.add("GRANT USAGE ON SCHEMA %s TO %s".formatted(quoted, ROLE));
+            ddl.add("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s".formatted(quoted, ROLE));
+            ddl.add("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s".formatted(quoted, ROLE));
+        }
+        // Labels are allowlisted identifiers joined by '.', so they cannot break out of the literal.
+        restrictive.forEach((table, asRestrictive) -> ddl.addAll(policyDdl(table.sql(), asRestrictive,
+                "%s('%s', %s::text)".formatted(observe, table.label(), column))));
+        ddl.addAll(policyDdl(probe, false, "%s('%s', 'tg-probe')".formatted(observe, PROBE_TABLE)));
 
         try (Statement statement = owner.createStatement()) {
             for (String sql : ddl) {
@@ -69,13 +100,45 @@ public final class ObserverInstaller {
         }
     }
 
-    private static List<String> policyDdl(String table, String column, boolean restrictive) {
+    /** Where an unqualified CREATE goes; null when no schema on the search_path exists. */
+    private static String currentSchema(Connection owner) throws SQLException {
+        try (Statement statement = owner.createStatement();
+             ResultSet rs = statement.executeQuery("SELECT current_schema()")) {
+            String schema = rs.next() ? rs.getString(1) : null;
+            if (schema == null) {
+                throw new SQLException("no schema on the search_path exists, so the observer has nowhere to live",
+                        "3F000");
+            }
+            return schema;
+        }
+    }
+
+    /**
+     * The observed role must reach everything the app reaches: every schema on the search_path (the
+     * app's bare names, the probe, {@code tg_observe}) and every schema holding an observed table
+     * (the app may qualify names off the path). Nothing else: a grant is a change to the database.
+     * System schemas are skipped; they are readable already and not ours to grant on.
+     */
+    private static Set<String> grantedSchemas(Connection owner, Collection<ObservedTable> observed) throws SQLException {
+        Set<String> schemas = new LinkedHashSet<>();
+        String sql = "SELECT s FROM unnest(current_schemas(false)) s "
+                + "WHERE s <> 'information_schema' AND left(s, 3) <> 'pg_'";
+        try (Statement statement = owner.createStatement(); ResultSet rs = statement.executeQuery(sql)) {
+            while (rs.next()) {
+                schemas.add(rs.getString(1));
+            }
+        }
+        observed.forEach(table -> schemas.add(table.schema()));
+        return schemas;
+    }
+
+    private static List<String> policyDdl(String table, boolean restrictive, String observe) {
         return List.of(
                 "ALTER TABLE %s ENABLE ROW LEVEL SECURITY".formatted(table),
                 "DROP POLICY IF EXISTS %s ON %s".formatted(POLICY, table),
                 // WITH CHECK (true): the write side is out of MVP scope.
-                "CREATE POLICY %s ON %s AS %s FOR ALL TO %s USING (tg_observe('%s', %s::text)) WITH CHECK (true)"
-                        .formatted(POLICY, table, restrictive ? "RESTRICTIVE" : "PERMISSIVE", ROLE, table, column));
+                "CREATE POLICY %s ON %s AS %s FOR ALL TO %s USING (%s) WITH CHECK (true)"
+                        .formatted(POLICY, table, restrictive ? "RESTRICTIVE" : "PERMISSIVE", ROLE, observe));
     }
 
     /** How the observer must be created on {@code table} given the policies already on it. */
@@ -85,8 +148,14 @@ public final class ObserverInstaller {
      * No foreign policy: permissive. A foreign permissive policy that applies to the observed role:
      * restrictive, so it is AND-ed. Foreign policies that never grant the role anything: refused,
      * because a restrictive-only table denies every row and the observer would see nothing.
+     *
+     * @param table {@code table} or {@code schema.table}, resolved like {@link #install} does
      */
     public static PolicyKind policyKind(Connection owner, String table) throws SQLException {
+        return policyKind(owner, ObservedTable.resolve(owner, table));
+    }
+
+    static PolicyKind policyKind(Connection owner, ObservedTable table) throws SQLException {
         List<ForeignPolicy> foreign = foreignPolicies(owner, table);
         if (foreign.isEmpty()) {
             return PolicyKind.PERMISSIVE;
@@ -96,7 +165,7 @@ public final class ObserverInstaller {
         }
         throw new IllegalStateException(("Table '%s' has RLS policies (%s) but none is permissive for role '%s'; "
                 + "the observer would see nothing. Add a permissive policy for %s or exclude the table.")
-                .formatted(table, foreign.stream().map(ForeignPolicy::name).toList(), ROLE, ROLE));
+                .formatted(table.label(), foreign.stream().map(ForeignPolicy::name).toList(), ROLE, ROLE));
     }
 
     private record ForeignPolicy(String name, boolean permissive, List<String> roles) {
@@ -106,13 +175,14 @@ public final class ObserverInstaller {
         }
     }
 
-    private static List<ForeignPolicy> foreignPolicies(Connection owner, String table) throws SQLException {
+    private static List<ForeignPolicy> foreignPolicies(Connection owner, ObservedTable table) throws SQLException {
         String sql = "SELECT policyname, permissive, roles::text[] FROM pg_policies "
-                + "WHERE schemaname = current_schema() AND tablename = ? AND policyname <> ? ORDER BY policyname";
+                + "WHERE schemaname = ? AND tablename = ? AND policyname <> ? ORDER BY policyname";
         List<ForeignPolicy> policies = new ArrayList<>();
         try (PreparedStatement statement = owner.prepareStatement(sql)) {
-            statement.setString(1, table);
-            statement.setString(2, POLICY);
+            statement.setString(1, table.schema());
+            statement.setString(2, table.name());
+            statement.setString(3, POLICY);
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
                     String[] roles = (String[]) rs.getArray(3).getArray();

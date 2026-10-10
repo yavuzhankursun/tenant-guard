@@ -359,6 +359,11 @@ için çağrılar sıralıdır.
 - **Mutasyon testi** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, JDBC çekirdeğinde
   PIT STRONGER mutator'ları): 226 mutantın %97'si öldürüldü; kalanlar eşdeğer mutant (void dönüş,
   proxy argüman şekilleri). Bozulan bir toplama yeşil kalamıyor.
+- **Spring Data'nın resmi `@TenantId` örneği** Postgres'te
+  ([examples/spring-data-tenantid](examples/spring-data-tenantid)): `findAll`, JPQL ve Hibernate
+  6.6'da `findById` filtreleniyor, öteki kiracıdan hiçbir satır okunmuyor; örneğin native sorgusu
+  filtrelenmiyor ve gözlemci bunu `person` üzerinde `ACTOR_MISMATCH` + `MULTI_TENANT_STATEMENT`
+  olarak raporluyor; örneğin kendisi bu boşluğu ancak "exception bekle" ile kapatabiliyor.
 - **Bir saha koşusu:** 231 GET endpoint, 98 migration ve 63 tenant tablosu olan üretimdeki bir
   Spring Boot uygulaması: 1 kesin sızıntı (tenant filtresiz bir şube-adı alt sorgusu), kod okunarak
   bulunan 1 yazma tarafı IDOR, 5 ilgisiz 500. İlk koşu 15 yanlış LEAK de üretti; aşağıdaki boş

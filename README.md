@@ -352,6 +352,11 @@ Calls are sequential because the guard's actor is global.
 - **Mutation testing** (`mvn -Pmutation org.pitest:pitest-maven:mutationCoverage`, PIT with the
   STRONGER mutators on the JDBC core): 97% of 226 mutants killed; the survivors are equivalent
   (void returns, proxy argument shapes). A broken harvest cannot stay green.
+- **Spring Data's official `@TenantId` example** on Postgres
+  ([examples/spring-data-tenantid](examples/spring-data-tenantid)): `findAll`, JPQL and, on
+  Hibernate 6.6, `findById` are filtered and read nothing of the other tenant; the sample's native
+  query is not, and the observer reports it as `ACTOR_MISMATCH` + `MULTI_TENANT_STATEMENT` on
+  `person`, exactly the gap the sample itself can only cover with an expected exception.
 - **One field run** on a production Spring Boot app with 231 GET endpoints, 98 migrations and 63
   tenant tables: 1 confirmed leak (a branch-name subquery without a tenant filter), 1 write-side
   IDOR found by reading the code, 5 unrelated 500s. The first run also produced 15 false LEAKs;

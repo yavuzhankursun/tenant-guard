@@ -17,6 +17,8 @@
 
     <properties>
         <java.version>21</java.version>
+        <!-- From `mvn install` at the repository root; CI passes the root pom's version. -->
+        <tenant-guard.version>0.2.0-SNAPSHOT</tenant-guard.version>
     </properties>
 
     <dependencies>
@@ -40,9 +42,9 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>dev.tenantguard</groupId>
+            <groupId>io.github.yavuzhankursun</groupId>
             <artifactId>tenant-guard</artifactId>
-            <version>0.1.0-SNAPSHOT</version>
+            <version>${tenant-guard.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

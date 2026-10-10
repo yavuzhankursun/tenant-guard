@@ -112,6 +112,6 @@ class EndpointScannerUnitTest {
                 .hasMessageContaining("seeder");
         assertThatThrownBy(() -> EndpointScanner.builder(mockMvc, guard).tenants("A", "A"))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThat(Set.of(Verdict.values())).hasSize(5);
+        assertThat(Set.of(Verdict.values())).hasSize(6);
     }
 }

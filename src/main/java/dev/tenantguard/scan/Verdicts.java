@@ -30,6 +30,10 @@ final class Verdicts {
         return new ScanResult(endpoint, null, 0, Verdict.SKIPPED, Set.of(), List.of(), reason);
     }
 
+    static ScanResult excluded(Endpoint endpoint, String rule) {
+        return new ScanResult(endpoint, null, 0, Verdict.EXCLUDED, Set.of(), List.of(), "excluded by rule " + rule);
+    }
+
     /** Diff-scored endpoint: {@code baseline} are the calls before the victim existed, {@code current} the one after. */
     static ScanResult listing(Endpoint endpoint, List<Response> baseline, Response current,
                               DifferentialProbe.Result diff, String victim, String attacker) {
@@ -68,6 +72,9 @@ final class Verdicts {
         if (status == UNAUTHORIZED) {
             return unauthenticated(endpoint, path, foreign, attacker);
         }
+        if (status >= 200 && status < 300 && EmptyBody.isEmpty(response.body())) {
+            return emptySuccess(endpoint, path, response, foreign, victim);
+        }
         if (status >= 200 && status < 300) {
             return result(endpoint, path, status, Verdict.LEAK, Set.of(), foreign,
                     join("%d for tenant %s's %s".formatted(status, victim, path), observerNote(foreign)));
@@ -77,6 +84,20 @@ final class Verdicts {
                     "%d for tenant %s's %s, but %s".formatted(status, victim, path, observerNote(foreign)));
         }
         return result(endpoint, path, status, Verdict.CLEAN, Set.of(), foreign, "");
+    }
+
+    /**
+     * 2xx without data for the victim's id is what a correctly filtered query looks like, so it is no
+     * LEAK by itself; only the observer can still tell that the victim's rows were read on the way.
+     */
+    private static ScanResult emptySuccess(Endpoint endpoint, String path, Response response, List<Finding> foreign,
+                                           String victim) {
+        String note = "%d with empty body %s for tenant %s's %s"
+                .formatted(response.status(), EmptyBody.render(response.body()), victim, path);
+        return foreign.isEmpty()
+                ? result(endpoint, path, response.status(), Verdict.CLEAN, Set.of(), foreign, note)
+                : result(endpoint, path, response.status(), Verdict.SUSPECT, Set.of(), foreign,
+                        note + ", but " + observerNote(foreign));
     }
 
     static List<Finding> actorMismatches(List<Finding> findings) {

@@ -20,6 +20,8 @@ import org.junit.jupiter.api.extension.ParameterContext;
 import org.junit.jupiter.api.extension.ParameterResolutionException;
 import org.junit.jupiter.api.extension.ParameterResolver;
 import org.junit.platform.commons.support.AnnotationSupport;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
+import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.beans.factory.annotation.ParameterResolutionDelegate;
 import org.springframework.context.ApplicationContext;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
@@ -33,11 +35,15 @@ import org.springframework.test.context.junit.jupiter.SpringExtension;
  * is installed and the guard is armed; it must deactivate the guard while seeding (rows are then
  * written as the owner and bypass the observer) and re-activate and reset afterwards. Installing
  * first is harmless: it only adds a role, a policy and grants, and the owner bypasses the policy.
+ *
+ * <p>Setup failures name what to check: the person running the tests is often not the one who
+ * wrote the app's wiring, and "permission denied" alone does not say which credentials matter.
  */
 public final class TenantGuardExtension implements BeforeEachCallback, AfterEachCallback, ParameterResolver {
 
     private static final Namespace NAMESPACE = Namespace.create(TenantGuardExtension.class);
     private static final System.Logger LOG = System.getLogger(TenantGuardExtension.class.getName());
+    private static final String INSUFFICIENT_PRIVILEGE = "42501";
 
     @Override
     public void beforeEach(ExtensionContext context) throws Exception {
@@ -45,6 +51,9 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
         ApplicationContext spring = SpringExtension.getApplicationContext(context);
         TenantGuard guard = spring.getBean(TenantGuard.class);
         DataSource dataSource = guardedDataSource(spring);
+        List<String> warnings = SchedulingCheck.warnings(spring);
+        warnings.forEach(warning -> LOG.log(warning.equals(SchedulingCheck.SUPPRESSED)
+                ? System.Logger.Level.INFO : System.Logger.Level.WARNING, warning));
 
         guard.deactivate();
         guard.reset();
@@ -54,14 +63,14 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                 seeder.seed(settings.victim());
                 seeder.seed(settings.attacker());
             });
-            TableDiscovery.Result tables = install(dataSource, settings);
+            TableDiscovery.Result tables = install(dataSource, settings.tenantColumn(), settings.tables());
             guard.activate();
             if (settings.selfCheck()) {
-                SelfCheck.verify(dataSource, guard);
+                selfCheck(dataSource, guard);
             }
             guard.reset();
             context.getStore(NAMESPACE).put(ObserverSetup.class, new ObserverSetup(
-                    settings.tenantColumn(), tables.tables(), tables.skipped(), settings.selfCheck()));
+                    settings.tenantColumn(), tables.tables(), tables.skipped(), settings.selfCheck(), warnings));
             armed = true;
         } finally {
             if (!armed) {
@@ -111,12 +120,10 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
      * The guard is inactive here, so the guarded DataSource runs {@code RESET ROLE}: the connection
      * uses the app's own credentials, which own the tables when the schema comes from Flyway.
      */
-    private static TableDiscovery.Result install(DataSource dataSource, TenantIsolationTest settings)
-            throws SQLException {
-        String column = settings.tenantColumn();
+    static TableDiscovery.Result install(DataSource dataSource, String column, String[] explicitTables) {
         try (Connection owner = dataSource.getConnection()) {
-            TableDiscovery.Result tables = settings.tables().length > 0
-                    ? new TableDiscovery.Result(List.of(settings.tables()), Map.of())
+            TableDiscovery.Result tables = explicitTables.length > 0
+                    ? new TableDiscovery.Result(List.of(explicitTables), Map.of())
                     : TableDiscovery.discover(owner, column);
             tables.skipped().forEach((table, reason) ->
                     LOG.log(System.Logger.Level.WARNING, "TenantGuard does not observe table ''{0}'': {1}", table, reason));
@@ -124,19 +131,61 @@ public final class TenantGuardExtension implements BeforeEachCallback, AfterEach
                 throw new IllegalStateException(("TenantGuard is blind: no observable table in the current schema "
                         + "has column '%s' (skipped: %s)").formatted(column, tables.skipped()));
             }
-            ObserverInstaller.install(owner, column, tables.tables());
-            if (!owner.getAutoCommit()) {
-                owner.commit();
-            }
+            installAs(owner, column, tables.tables());
             return tables;
+        } catch (SQLException e) {
+            throw new IllegalStateException(("TenantGuard could not read the schema through the app's DataSource "
+                    + "(SQLState %s: %s).%nCheck the spring.datasource.* settings of the test context and that the "
+                    + "migrations ran.").formatted(e.getSQLState(), e.getMessage()), e);
         }
     }
 
-    private static DataSource guardedDataSource(ApplicationContext spring) throws SQLException {
-        DataSource dataSource = spring.getBean(DataSource.class);
+    private static void installAs(Connection owner, String column, List<String> tables) throws SQLException {
+        try {
+            ObserverInstaller.install(owner, column, tables);
+            if (!owner.getAutoCommit()) {
+                owner.commit();
+            }
+        } catch (SQLException e) {
+            String user = owner.getMetaData().getUserName();
+            String hint = INSUFFICIENT_PRIVILEGE.equals(e.getSQLState())
+                    ? "The app's DataSource user must own the tenant tables (create the schema with Flyway or "
+                            + "migrations as that user, not ddl-auto under another role) and be allowed to create roles."
+                    : "The schema must exist (migrations ran) and be owned by the app's DataSource user.";
+            throw new IllegalStateException("TenantGuard could not install the observer as user '%s' (SQLState %s: %s).%n%s"
+                    .formatted(user, e.getSQLState(), e.getMessage(), hint), e);
+        }
+    }
+
+    /** A blind self-check keeps its own message; a self-check that cannot even run says what it needed. */
+    static void selfCheck(DataSource dataSource, TenantGuard guard) {
+        try {
+            SelfCheck.verify(dataSource, guard);
+        } catch (SQLException e) {
+            throw new IllegalStateException(("TenantGuard self-check could not run: %s.%nIt needs the observer "
+                    + "installed (role %s, table %s) and a DataSource user that may SET ROLE to the configured role.")
+                    .formatted(e.getMessage(), ObserverInstaller.ROLE, ObserverInstaller.PROBE_TABLE), e);
+        }
+    }
+
+    static DataSource guardedDataSource(ApplicationContext spring) throws SQLException {
+        List<String> names = List.of(spring.getBeanNamesForType(DataSource.class));
+        DataSource dataSource;
+        try {
+            dataSource = spring.getBean(DataSource.class);
+        } catch (NoUniqueBeanDefinitionException e) {
+            throw new IllegalStateException("TenantGuard found several DataSource beans %s and none is @Primary; "
+                    .formatted(names) + "mark the one the app's repositories use as @Primary.", e);
+        } catch (NoSuchBeanDefinitionException e) {
+            throw new IllegalStateException("TenantGuard found no DataSource bean: check spring.datasource.url/username/"
+                    + "password (or the environment keys your app reads them from) in the test context.", e);
+        }
         if (!dataSource.isWrapperFor(GuardedDataSource.class)) {
-            throw new IllegalStateException("The DataSource bean is not a GuardedDataSource; "
-                    + "TenantGuardConfiguration must be imported (@TenantIsolationTest does that)");
+            throw new IllegalStateException(("The DataSource bean '%s' (%s) is not a GuardedDataSource: import "
+                    + "TenantGuardConfiguration (@TenantIsolationTest does that), and check which bean created the "
+                    + "DataSource; one built outside the context or replaced after post-processing is never wrapped.")
+                    .formatted(names.size() == 1 ? names.getFirst() : "@Primary of " + names,
+                            dataSource.getClass().getSimpleName()));
         }
         return dataSource;
     }

@@ -12,12 +12,21 @@ import java.util.TreeMap;
  * @param installedTables tables carrying the observer policy
  * @param skippedTables   table name to the reason it is not observed (auto-discovery only)
  * @param selfChecked     whether {@link dev.tenantguard.SelfCheck} ran and passed
+ * @param warnings        conditions that can make findings misleading, e.g. scheduled jobs running
+ *                        under the test's actor; each is also logged as it is detected
  */
 public record ObserverSetup(String tenantColumn, List<String> installedTables, Map<String, String> skippedTables,
-                            boolean selfChecked) {
+                            boolean selfChecked, List<String> warnings) {
 
     public ObserverSetup {
         installedTables = List.copyOf(installedTables);
         skippedTables = Collections.unmodifiableMap(new TreeMap<>(skippedTables));
+        warnings = List.copyOf(warnings);
+    }
+
+    /** Without warnings; kept so code written against the four-field record still compiles. */
+    public ObserverSetup(String tenantColumn, List<String> installedTables, Map<String, String> skippedTables,
+                         boolean selfChecked) {
+        this(tenantColumn, installedTables, skippedTables, selfChecked, List.of());
     }
 }

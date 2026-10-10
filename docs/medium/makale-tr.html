@@ -1,0 +1,120 @@
+<h1>Unutulan tenant filtresini veritabanının içinden yakalamak</h1>
+<p><em>HTTP'den görünmeyen kiracılar arası sızıntılar için bir Postgres RLS hilesi ve onu güvenilir hale getirirken JDBC sürücüsünden yediğim sürprizler.</em></p>
+
+<p>Çok kiracılı bir uygulamada en çok korktuğum hata hep aynıydı: bir sorguda <code>tenant_id</code> filtresini unutmak. Bütün müşterilerin verisi aynı tablolarda duruyor ve aralarındaki tek duvar, her sorguya eklenmesi gereken o bir satırlık <code>WHERE tenant_id = ?</code>. Yüzlerce sorgunun birinde unutursanız B firması A firmasının rakamlarını görmeye başlıyor. Çoğu zaman da kimse fark etmiyor.</p>
+
+<p>Bu yazıda bu hatayı testlerde yakalamak için yazdığım açık kaynak kütüphaneyi, <strong>tenant-guard</strong>'ı ve onu yazarken karşıma çıkan, hiç beklemediğim sorunları anlatıyorum.</p>
+
+<h2>HTTP'den bakınca neden görünmüyor?</h2>
+
+<p>İlk aklıma gelen işin bilinen yoluydu: B olarak giriş yap, A'nın isteklerini tekrar at, yanıtları karşılaştır. Burp'ün Autorize eklentisi ya da AuthProbe gibi araçlar bunu yapıyor. Sonra şöyle bir rapor endpoint'i düşündüm:</p>
+
+<pre>-- GET /reports/total arkasındaki sorgu, tenant filtresi unutulmuş
+SELECT sum(amount) FROM invoice;
+-- B'ye dönen yanıt: {"total": 1300}</pre>
+
+<p>B'ye dönen 1300'ün içinde A'nın faturaları da var. Ama yanıtta A'ya ait bir id, isim ya da alan yok. Karşılaştıracak hiçbir şey yok. Dışarıdan bakan bir araç bu endpoint'i temiz sayar. Raporlar, toplamlar, sayaçlar: sızıntının en zor fark edilen hali bunlar.</p>
+
+<figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/medium/disaridan-iceriden.png" alt="Dışarıdan bakan tarayıcı temiz bir yanıt görür; içeriden bakınca A'nın satırlarının okunduğu görünür"></figure>
+
+<p>Veritabanının içinden bakınca soru değişiyor: B'nin isteği sırasında hangi kiracının satırları okundu? Bunu öğrenmek için Postgres'in zaten her satırda çalıştırdığı bir mekanizmayı kullandım.</p>
+
+<h2>Hiçbir şeyi engellemeyen bir RLS politikası</h2>
+
+<p>Row-level security (RLS) normalde satırları gizlemek için kullanılır. Politika her satır için bir ifade çalıştırır, ifade false dönerse satır görünmez. Ben ifadenin her zaman true dönmesini ama dönmeden önce bir NOTICE atmasını sağladım:</p>
+
+<pre>CREATE FUNCTION tg_observe(tbl text, row_tenant text) RETURNS boolean AS $$
+BEGIN
+  RAISE NOTICE 'tg|%|%', tbl, row_tenant;
+  RETURN true;
+END $$ LANGUAGE plpgsql;
+CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
+  USING (tg_observe('invoice', tenant_id::text)) WITH CHECK (true);</pre>
+
+<p>Yani politika kimseyi engellemiyor, sadece "şu tablodan şu kiracının satırını okudum" diye not düşüyor. Test sırasında kütüphane uygulamanın <code>DataSource</code>'unu sarmalıyor, her bağlantıyı <code>tg_app</code> rolüne geçiriyor ve bu notları JDBC'nin uyarı zincirinden topluyor. Test B adına çalışırken <code>invoice|A</code> notu gelirse B'nin isteği A'nın satırını okutmuş demektir.</p>
+
+<figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/medium/notice-akisi.png" alt="Bir NOTICE'in Postgres'ten test raporuna yolculuğu"></figure>
+
+<p>Aslında ilk aklıma gelen bir log tablosuydu: politika okuduğu her satırı bir tabloya yazsın. İki sebepten vazgeçtim. <code>@Transactional(readOnly = true)</code> bir metot <code>READ ONLY</code> transaction açıyor ve o INSERT doğrudan hata veriyor. Rollback olan bir istek de logu kendisiyle birlikte siliyor. NOTICE ise veri değil, protokol mesajı; ikisinden de etkilenmiyor.</p>
+
+<p>Ayrı bir rol kullanmamın sebebi de şu: Testcontainers'ın varsayılan kullanıcısı superuser ve superuser'lar RLS'e hiç takılmıyor. Bunu atlasaydım araç hiçbir şey bulamazdı, ben de uygulamanın temiz olduğunu sanardım. O yüzden her test başlamadan önce bir kontrol sorgusu çalışıyor; NOTICE gelmezse test hiç başlamıyor. Bu tür bir aracın yapabileceği en kötü şey sessizce kör kalmak.</p>
+
+<h2>Doğru yazılmış sorgu da alarm verince</h2>
+
+<p>İlk sürpriz, doğru yazılmış bir sorgunun alarm vermesi oldu:</p>
+
+<pre>SELECT l.id FROM invoice_line l
+JOIN invoice i ON i.id = l.invoice_id
+WHERE i.tenant_id = 'B';</pre>
+
+<p>Tablo küçükken Postgres <code>invoice_line</code>'ı baştan sona tarıyor. Politika A'nın satırlarını görüyor, sonra join onları eliyor. Sonuç doğru, ama satırlar okunmuş. Gözlemcinin okumayı gördüğünü, sonucu görmediğini burada anladım.</p>
+
+<p>Bu yüzden her bulguyu tek başına "şüpheli" saydım ve ikinci bir kontrol ekledim. Önce yalnızca B'nin verisi varken B'nin yanıtlarını kaydediyorum, sonra A'nın verisini ekleyip aynı istekleri tekrar atıyorum. Yanıt değiştiyse A'nın verisi sızmıştır. Filtresiz <code>SUM</code> değişiyor, doğru yazılmış JOIN değişmiyor.</p>
+
+<p><code>MAX</code>'te bu da yetmedi. A'nın tutarları B'ninkilerin arasında kalınca <code>MAX</code> aynı çıkıyor ve fark hiçbir şey görmüyor. Çözümü basit ama aklıma gelmesi zaman aldı: kurban kiracıyı uç değerlerle doldurmak. En küçük ve en büyük tutar, 1970 ve 2999 tarihleri, sıralamada en başa ve en sona düşen metinler.</p>
+
+<p>Ters yönde bir sürpriz de oldu. Postgres, <code>text</code> ve <code>bigint</code> üzerindeki <code>=</code> gibi "leakproof" koşulları politikadan önce çalıştırıyor. <code>WHERE tenant_id = 'B'</code> A'nın satırlarını gözlemci görmeden eliyor ki doğrusu da bu. Ama aynı sebepten, cevabı A'nın verisine bağlı olmayan bir <code>EXISTS</code> sorgusunu araç hiç göremiyor.</p>
+
+<h2>JDBC sürücüsü pasif bir liste değilmiş</h2>
+
+<p>Uyarı zincirini okumanın kolay olduğunu düşünüyordum: <code>Statement</code>'a bir proxy koy, execute'tan sonra <code>getWarnings()</code> çağır, bitti. Her JDBC kullanım şekli için ayrı bir test yazınca durum değişti: düz Statement, aynı PreparedStatement'ı iki kez çalıştırmak, batch, cursor, <code>unwrap</code>, Hibernate, <code>JdbcTemplate</code>, toplam 33 yol. Bir test kırmızı olunca pgjdbc'nin bytecode'unu <code>javap</code> ile açıp ne olduğuna baktım. Mesajların sessizce kaybolduğu beş yer çıktı:</p>
+
+<ol>
+<li>pgjdbc her execute'un başında uyarı zincirini kendi içinde siliyor, <code>clearWarnings()</code> çağırmadan. Aynı PreparedStatement ikinci kez çalışınca ilk çalıştırmanın mesajları gidiyordu.</li>
+<li><code>fetchSize</code> verilmiş bir sorguda, transaction içindeyken, sonradan çekilen partilerin mesajları Statement'a değil ResultSet'e düşüyor. İlk partiden sonraki satırları hiç görmüyordum.</li>
+<li>HikariCP üzerinden <code>unwrap(Connection.class)</code> ham sürücü bağlantısını veriyordu. Ondan açılan sorguları kimse izlemiyordu.</li>
+<li>Sürücü zinciri benim göremediğim bir yerde yenileyince okuma imleci eski yerinde kalıyor ve yeni mesajları atlıyordu.</li>
+<li>Havuzlar <code>executeQuery</code> ve <code>getResultSet</code> için ayrı sarmalayıcılar üretiyor. Aynı sonuç iki kez sarılınca mesajlar iki kez sayılıyordu.</li>
+</ol>
+
+<p>Bağlantı havuzları üç sorun daha getirdi. En kötüsü şuydu: tomcat-jdbc, DBCP2 ya da c3p0'da statement cache açıkken önbellekteki PreparedStatement, önceki kullanıcının uyarı zincirini bir sonrakine taşıyor. Satırlar iki kez sayılıyor, hatta A'nın kendi okuması B'ye yazılıyordu. HikariCP'de bunların hiçbiri görünmüyor. Uzun süre sadece Hikari ile test ettiğim için ben de fark etmemiştim.</p>
+
+<h2>Benim makinemde çalışıyordu</h2>
+
+<p>Bu yüzden CI'a her havuzu, Postgres 13'ten 17'ye kadar her sürümü, Spring Boot 3.2'den 3.5'e kadar her sürümü ve iki pgjdbc sürümünü ayrı ayrı koşan bir matris kurdum. İlk koşuda 16 job'ın 16'sı da kırmızıydı. Mac'imde hepsi yeşildi.</p>
+
+<p>Sebep testlerin kendisiydi. Bir test havuzdan aldığı bağlantının <code>search_path</code>'ini değiştirip öyle geri bırakıyordu. macOS'ta testlerin sırası tesadüfen hep uyuyordu, Linux'ta bozuldu. Onu düzelttim, bu sefer tomcat-jdbc job'ı 30 dakika boyunca asılı kaldı. Başka bir test bağlantıyı autocommit kapalı iade etmiş, açık kalan transaction tabloyu kilitlemiş, kütüphanenin <code>ALTER TABLE</code>'ı da sonsuza kadar beklemiş. Hikari bağlantıyı geri alırken bunu kendisi düzeltiyor, tomcat-jdbc düzeltmiyor. O günden beri kurulum bir <code>lock_timeout</code> ile çalışıyor; kilidi alamazsa beklemek yerine kilidi kimin tuttuğunu yazıp duruyor.</p>
+
+<h2>Sonuçlara ne kadar güvenebilirim?</h2>
+
+<p>Bir güvenlik aracının iddialarına kanıtsız güvenmek istemedim. Şu an elimde olanlar:</p>
+
+<ul>
+<li>Testcontainers üzerindeki gerçek Postgres'e karşı koşan 503 test.</li>
+<li>33 kalıplık bir sızıntı korpusu. Her kalıp için gözlemcinin, pasif kuralın ve önce/sonra farkının ne diyeceği testte yazılı.</li>
+<li>Çekirdekte mutasyon testi (PIT). Kodu bozan mutantların %97'si en az bir testi kırmızıya çeviriyor; kalanlar davranışı değiştirmeyen eşdeğer mutantlar.</li>
+<li>Her gece koşan ortam matrisi: Postgres 13–17, Spring Boot 3.2–3.5, iki pgjdbc sürümü, beş bağlantı havuzu, <code>integer</code>, <code>uuid</code> ve <code>text</code> tenant kolonları, farklı şemalar.</li>
+</ul>
+
+<figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/medium/kor-noktalar.png" alt="33 sızıntı kalıbı ve her katmanın sonucu"></figure>
+
+<p>Tablodaki gri satırlar aracın göremediği yerler. Bunları saklamak yerine her biri için neden kör kaldığını gösteren ayrı bir test yazdım.</p>
+
+<h2>Spring Data'nın kendi örneğinde denedim</h2>
+
+<p>Gerçek bir kod üzerinde görmek için Spring Data'nın resmi Hibernate <code>@TenantId</code> örneğini H2'den Postgres'e taşıyıp taradım. <code>findAll</code>, JPQL sorgusu ve Hibernate 6.6'da <code>findById</code> filtreleniyor; öbür kiracıdan tek satır okunmuyor. (Örnekte "findById tenant'ı dikkate almıyor" diye kapatılmış test artık eskimiş.) Native sorgu ise filtrelenmiyor. Örnek bunu biliyor ve testinde "beklenenden fazla sonuç" hatası bekliyor. tenant-guard ise okumanın kendisini, hangi tablodan hangi kiracının satırının okunduğuyla birlikte raporluyor. Hibernate'in filtresi native SQL'e uzanamıyor; bu kütüphaneyi yazmamın sebebi de bu boşluktu.</p>
+
+<h2>Kullanmak</h2>
+
+<p>Bir JUnit 5 testine tek bir anotasyon eklemek yetiyor. Kütüphane tenant kolonunu taşıyan tabloları kendisi buluyor, gözlemciyi kuruyor ve kör olmadığını kontrol ediyor:</p>
+
+<pre>@SpringBootTest
+@TenantIsolationTest(tenantColumn = "tenant_id")
+class TenantIsolationIT {
+    @Autowired InvoiceRepository invoices;
+    @Test
+    void kiracilarBirbiriniGoremez(TenantGuard guard) {
+        guard.runAs("B", invoices::findAll);
+        assertThat(guard.findings(Finding.Rule.ACTOR_MISMATCH)).isEmpty();
+    }
+}</pre>
+
+<p>HTTP tarafı için bir de endpoint tarayıcısı var. Spring'in handler mapping'lerinden bütün GET endpoint'lerini buluyor, her birini B olarak çağırıyor ve önce/sonra farkıyla gözlemcinin bulgularını birleştiriyor. Örnek uygulamadaki çıktısı şöyle:</p>
+
+<figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/scan-report.png" alt="assertNoLeaks() çıktısı: üç sızıntı, iki temiz endpoint"></figure>
+
+<h2>Neyi göremiyor?</h2>
+
+<p><code>security_invoker</code> olmayan view'lar ve <code>SECURITY DEFINER</code> fonksiyonlar sahibinin yetkisiyle çalışıyor; sahip RLS'ten muaf olduğu için gözlemci bunları görmüyor, önce/sonra farkı görüyor. Baseline sırasında ısınan bir <code>@Cacheable</code> sonucu Postgres'e bir daha gitmiyor. Her kiracıya ayrı şema ya da ayrı veritabanı veren tasarımlarda tenant kolonu olmadığı için araç işe yaramıyor. Şimdilik sadece GET endpoint'lerini tarıyor ve sadece Postgres'te çalışıyor, çünkü bütün mekanizma RLS, NOTICE ve pgjdbc'nin uyarı zincirine dayanıyor.</p>
+
+<p>En çok zamanımı alan kısım sızıntıyı bulmak değil, aracın kör kalmadığından emin olmaktı. Kod, 33 kalıplık korpus ve her tasarım kararının gerekçesi GitHub'da: <a href="https://github.com/yavuzhankursun/tenant-guard">github.com/yavuzhankursun/tenant-guard</a>. Kendi projenizde denerseniz sonucu duymak isterim; özellikle yanlış alarm verdiği ya da bir şeyi kaçırdığı bir durum olursa. Kütüphane henüz Maven Central'da değil; şimdilik repoyu klonlayıp <code>mvn install</code> ile kurmak gerekiyor.</p>

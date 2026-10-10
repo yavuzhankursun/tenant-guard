@@ -12,6 +12,8 @@ as such.
 
 Status: prototype. PostgreSQL only. Java 21, Spring Boot 3.5, JUnit 5.
 
+![assertNoLeaks() output on the sample app: three planted leaks, two clean endpoints](docs/scan-report.svg)
+
 Design decisions, in the order they were made, with what each one replaced: [docs/design-notes.md](docs/design-notes.md).
 
 ## Why inside the database

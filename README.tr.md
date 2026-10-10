@@ -13,6 +13,8 @@ raporlar ve yabancı satırı hiçbir zaman "satır olarak" döndürmeyen aggreg
 
 Durum: prototip. Yalnızca PostgreSQL. Java 21, Spring Boot 3.5, JUnit 5.
 
+![Örnek uygulamada assertNoLeaks() çıktısı: üç ekili sızıntı, iki temiz endpoint](docs/scan-report.svg)
+
 Tasarım kararları, verildikleri sırayla ve neyin yerine geçtikleriyle (İngilizce): [docs/design-notes.md](docs/design-notes.md).
 
 ## Neden veritabanının içinden

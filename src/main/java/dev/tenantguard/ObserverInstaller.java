@@ -99,11 +99,6 @@ public final class ObserverInstaller {
                 .formatted(table, foreign.stream().map(ForeignPolicy::name).toList(), ROLE, ROLE));
     }
 
-    /** Names of the RLS policies on {@code table} that are not the observer, in name order. */
-    static List<String> foreignPolicyNames(Connection owner, String table) throws SQLException {
-        return foreignPolicies(owner, table).stream().map(ForeignPolicy::name).toList();
-    }
-
     private record ForeignPolicy(String name, boolean permissive, List<String> roles) {
 
         boolean grantsObservedRole() {

@@ -124,7 +124,46 @@ Five "silent under-reporting" bugs were found by writing a test per access path
 
 Each fix was made only after a test showed the loss (expected N rows, observed fewer).
 
-## 8. Things deliberately kept simple
+## 8. What the field run taught
+
+The first run on a real app (231 GET endpoints, 63 tenant tables, 98 migrations) found one
+confirmed leak and fifteen false ones. Every false positive was the tool's fault:
+
+- Eight were `200 []` / `200 0.00` / `200 null` on by-id endpoints whose query was correctly
+  filtered. "2xx on the victim's id = LEAK" was too crude. Now an empty body is never a LEAK by
+  itself; it is SUSPECT if the observer saw the victim's rows, CLEAN otherwise. The rule is flat
+  so a wrapper cannot hide data, and `Extremes` seeding keeps a real `0` from looking empty.
+- Four were platform-admin endpoints that list every tenant by design, reachable because the
+  attacker token carried every permission. `EndpointScanner.exclude(...)` with the rule in the
+  report note; excluding everything fails.
+- The app's `@Scheduled` jobs would have read every tenant under the global actor. The extension
+  now warns, and `tenantguard.scheduling=off` installs a scheduler that runs nothing.
+- Setup failures were cryptic; they now say which bean, role or property to check.
+
+The leak itself was a `(select name from branches where id = ?)` subquery in a fallback branch,
+the kind of thing no entity-level filter covers.
+
+## 9. What the leak corpus proved
+
+Thirty-three patterns, each asserting observer, passive rule and diff (`LeakCorpusTest`). Two
+results were not what we expected. Views without `security_invoker` and `SECURITY DEFINER`
+functions run as their owner, who bypasses RLS, so the observer is blind to them; the diff still
+catches both. And a `@Cacheable` result warmed during the baseline never reaches Postgres again,
+so even the observer is blind; clearing the cache after seeding the victim fixes it. The
+leakproof `EXISTS` blind spot turned out narrow: it only exists while the answer does not depend
+on the victim's rows. `CorpusMechanismTest` shows each mechanism (planner filter order from
+`EXPLAIN`, owner catalogs, re-owning the view to `tg_app` and watching it become observed).
+
+## 10. Mutation testing
+
+PIT with the STRONGER mutators runs on the JDBC core (`mvn -Pmutation ...`). The first run
+killed 74%; the survivors were test gaps, not bugs, the worst being that the self-check could
+stop looking for the probe NOTICE without any test noticing. After unit tests with fake JDBC
+chains and a few Postgres-backed blindness tests, 96% are killed and the remaining 8 are
+equivalent mutants. The point is the same as the self-check's: a harvest that silently stops
+working must turn something red.
+
+## 11. Things deliberately kept simple
 
 - The actor is a global, not a `ThreadLocal`: the scanner issues one request at a time, and a
   global survives `@Async` and thread pools. Cost: no parallel test execution.

@@ -102,20 +102,19 @@ seed edin. O zaman `MAX`, `MIN` ve `ORDER BY ... LIMIT 1` A sızar sızmaz deği
 
 ## Hızlı başlangıç
 
-Test bağımlılığını ekleyin (koordinat `io.github.yavuzhankursun:tenant-guard`; ilk Maven Central
-sürümüne kadar bu repoda `mvn install` ile kurun):
+Test bağımlılığını Maven Central'dan ekleyin:
 
 ```xml
 <dependency>
     <groupId>io.github.yavuzhankursun</groupId>
     <artifactId>tenant-guard</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0</version>
     <scope>test</scope>
 </dependency>
 ```
 
 ```kotlin
-testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0-SNAPSHOT") // Gradle Kotlin DSL
+testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0") // Gradle Kotlin DSL
 ```
 
 Kütüphane geçişli bağımlılık getirmez; Spring, JUnit ve Jackson sizin projenizden gelir. Kotlin +
@@ -465,7 +464,6 @@ taşır (bulgular fetch partisi başına bölünür, satır sayıları tam kalı
 
 - Açık kaynak çok kiracılı Spring projelerinde koşular.
 - Kurulumda `security_invoker` olmayan view'lar ve `SECURITY DEFINER` fonksiyonlar için uyarı.
-- Maven Central'a ilk sürüm ([docs/RELEASING.md](docs/RELEASING.md)).
 - Yazma taraması: gövde içindeki id'leri kurbanınkiyle değiştirmek; PUT/PATCH'te spoof denemesi.
 - CSRF 403'ünü gerçek yetki reddinden ayıran bir sahip denemesi.
 

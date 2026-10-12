@@ -8,7 +8,7 @@
          packages stay dev.tenantguard: Central does not tie package names to the groupId. -->
     <groupId>io.github.yavuzhankursun</groupId>
     <artifactId>tenant-guard</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0-SNAPSHOT</version>
     <name>tenant-guard</name>
     <description>Detects cross-tenant data leaks in Spring/JDBC tests from inside PostgreSQL via an RLS observer policy.</description>
     <url>https://github.com/yavuzhankursun/tenant-guard</url>

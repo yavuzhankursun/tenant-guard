@@ -33,6 +33,8 @@ CREATE POLICY tg_observer ON invoice FOR ALL TO tg_app
 
 <p>Yani politika kimseyi engellemiyor, sadece "şu tablodan şu kiracının satırını okudum" diye not düşüyor. Test sırasında kütüphane uygulamanın <code>DataSource</code>'unu sarmalıyor, her bağlantıyı <code>tg_app</code> rolüne geçiriyor ve bu notları JDBC'nin uyarı zincirinden topluyor. Test B adına çalışırken <code>invoice|A</code> notu gelirse B'nin isteği A'nın satırını okutmuş demektir.</p>
 
+<p>Gerçek kurulumda notun başında bir de anahtar var: kurulum sırasında rastgele üretilen 16 baytlık bir değer. Uygulamanın kendi kodu ya da bir trigger <code>tg|</code> ile başlayan bir NOTICE atsa bile kütüphane onu saymıyor, sadece kendi kurduğu politikanın mesajlarına inanıyor.</p>
+
 <figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/medium/notice-akisi.png" alt="Bir NOTICE'in Postgres'ten test raporuna yolculuğu"></figure>
 
 <p>Aslında ilk aklıma gelen bir log tablosuydu: politika okuduğu her satırı bir tabloya yazsın. İki sebepten vazgeçtim. <code>@Transactional(readOnly = true)</code> bir metot <code>READ ONLY</code> transaction açıyor ve o INSERT doğrudan hata veriyor. Rollback olan bir istek de logu kendisiyle birlikte siliyor. NOTICE ise veri değil, protokol mesajı; ikisinden de etkilenmiyor.</p>
@@ -80,10 +82,10 @@ WHERE i.tenant_id = 'B';</pre>
 <p>Bir güvenlik aracının iddialarına kanıtsız güvenmek istemedim. Şu an elimde olanlar:</p>
 
 <ul>
-<li>Testcontainers üzerindeki gerçek Postgres'e karşı koşan 503 test.</li>
+<li>Testcontainers üzerindeki gerçek Postgres'e karşı koşan 584 test.</li>
 <li>33 kalıplık bir sızıntı korpusu. Her kalıp için gözlemcinin, pasif kuralın ve önce/sonra farkının ne diyeceği testte yazılı.</li>
 <li>Çekirdekte mutasyon testi (PIT). Kodu bozan mutantların %97'si en az bir testi kırmızıya çeviriyor; kalanlar davranışı değiştirmeyen eşdeğer mutantlar.</li>
-<li>Her gece koşan ortam matrisi: Postgres 13–17, Spring Boot 3.2–3.5, iki pgjdbc sürümü, beş bağlantı havuzu, <code>integer</code>, <code>uuid</code> ve <code>text</code> tenant kolonları, farklı şemalar.</li>
+<li>Her gece koşan ortam matrisi: Postgres 13–17, Spring Boot 3.2–3.5, iki pgjdbc sürümü, dört bağlantı havuzu ve havuzsuz bağlantı, <code>integer</code>, <code>uuid</code> ve <code>text</code> tenant kolonları, farklı şemalar.</li>
 </ul>
 
 <figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/medium/kor-noktalar.png" alt="33 sızıntı kalıbı ve her katmanın sonucu"></figure>
@@ -96,7 +98,11 @@ WHERE i.tenant_id = 'B';</pre>
 
 <h2>Kullanmak</h2>
 
-<p>Bir JUnit 5 testine tek bir anotasyon eklemek yetiyor. Kütüphane tenant kolonunu taşıyan tabloları kendisi buluyor, gözlemciyi kuruyor ve kör olmadığını kontrol ediyor:</p>
+<p>Kütüphane Maven Central'da, test bağımlılığı olarak eklemek yeterli:</p>
+
+<pre>testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0")</pre>
+
+<p>Sonra bir JUnit 5 testine tek bir anotasyon eklemek yetiyor. Kütüphane tenant kolonunu taşıyan tabloları kendisi buluyor, gözlemciyi kuruyor ve kör olmadığını kontrol ediyor:</p>
 
 <pre>@SpringBootTest
 @TenantIsolationTest(tenantColumn = "tenant_id")
@@ -109,12 +115,14 @@ class TenantIsolationIT {
     }
 }</pre>
 
-<p>HTTP tarafı için bir de endpoint tarayıcısı var. Spring'in handler mapping'lerinden bütün GET endpoint'lerini buluyor, her birini B olarak çağırıyor ve önce/sonra farkıyla gözlemcinin bulgularını birleştiriyor. Örnek uygulamadaki çıktısı şöyle:</p>
+<p>HTTP tarafı için bir de endpoint tarayıcısı var. Spring'in handler mapping'lerinden bütün GET endpoint'lerini buluyor, her birini B olarak çağırıyor ve önce/sonra farkıyla gözlemcinin bulgularını birleştiriyor.</p>
+
+<p>Yazma isteklerini de tarıyor. POST, PUT, PATCH ve DELETE endpoint'lerini B olarak A'nın id'leriyle çağırıyor ve her çağrıdan önce ve sonra A'nın satırlarının kopyasını alıyor. A'nın bir satırı değiştiyse, silindiyse ya da A adına yeni bir satır açıldıysa sızıntı sayıyor; endpoint 404 dönse bile. İstenirse POST gövdesindeki tenant alanını A'nın değeriyle doldurup "B, A adına kayıt açabiliyor mu?" diye de deniyor. GET taramasının örnek uygulamadaki çıktısı şöyle:</p>
 
 <figure><img src="https://raw.githubusercontent.com/yavuzhankursun/tenant-guard/main/docs/scan-report.png" alt="assertNoLeaks() çıktısı: üç sızıntı, iki temiz endpoint"></figure>
 
 <h2>Neyi göremiyor?</h2>
 
-<p><code>security_invoker</code> olmayan view'lar ve <code>SECURITY DEFINER</code> fonksiyonlar sahibinin yetkisiyle çalışıyor; sahip RLS'ten muaf olduğu için gözlemci bunları görmüyor, önce/sonra farkı görüyor. Baseline sırasında ısınan bir <code>@Cacheable</code> sonucu Postgres'e bir daha gitmiyor. Her kiracıya ayrı şema ya da ayrı veritabanı veren tasarımlarda tenant kolonu olmadığı için araç işe yaramıyor. Şimdilik sadece GET endpoint'lerini tarıyor ve sadece Postgres'te çalışıyor, çünkü bütün mekanizma RLS, NOTICE ve pgjdbc'nin uyarı zincirine dayanıyor.</p>
+<p><code>security_invoker</code> olmayan view'lar ve <code>SECURITY DEFINER</code> fonksiyonlar sahibinin yetkisiyle çalışıyor; sahip RLS'ten muaf olduğu için gözlemci bunları görmüyor, önce/sonra farkı görüyor. Baseline sırasında ısınan bir <code>@Cacheable</code> sonucu Postgres'e bir daha gitmiyor. Her kiracıya ayrı şema ya da ayrı veritabanı veren tasarımlarda tenant kolonu olmadığı için araç işe yaramıyor. Şimdilik sadece Postgres'te çalışıyor, çünkü bütün mekanizma RLS, NOTICE ve pgjdbc'nin uyarı zincirine dayanıyor.</p>
 
-<p>En çok zamanımı alan kısım sızıntıyı bulmak değil, aracın kör kalmadığından emin olmaktı. Kod, 33 kalıplık korpus ve her tasarım kararının gerekçesi GitHub'da: <a href="https://github.com/yavuzhankursun/tenant-guard">github.com/yavuzhankursun/tenant-guard</a>. Kendi projenizde denerseniz sonucu duymak isterim; özellikle yanlış alarm verdiği ya da bir şeyi kaçırdığı bir durum olursa. Kütüphane henüz Maven Central'da değil; şimdilik repoyu klonlayıp <code>mvn install</code> ile kurmak gerekiyor.</p>
+<p>En çok zamanımı alan kısım sızıntıyı bulmak değil, aracın kör kalmadığından emin olmaktı. Kod, 33 kalıplık korpus ve her tasarım kararının gerekçesi GitHub'da: <a href="https://github.com/yavuzhankursun/tenant-guard">github.com/yavuzhankursun/tenant-guard</a>. Kendi projenizde denerseniz sonucu duymak isterim; özellikle yanlış alarm verdiği ya da bir şeyi kaçırdığı bir durum olursa.</p>

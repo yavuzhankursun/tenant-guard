@@ -31,11 +31,16 @@ by signing in to the Central Portal with the GitHub account; no domain is needed
 
 ## Each release
 
+Run Maven through `./mvnw` (Maven 3.9.11, checksum-pinned), as the release workflow does. With Maven
+3.10, central-publishing-maven-plugin 0.11.0 puts local-repository files (`maven-metadata-local.xml`,
+`_remote.repositories`) into the bundle and Central rejects it with "Bundle has content that does NOT
+have a .pom file".
+
 1. **Dry run.** Actions → *Release* → *Run workflow* on `main` with `dry_run` checked. It checks
    the secrets, runs the tests and signs the artifacts; nothing is uploaded.
 2. **Version and changelog.**
    ```bash
-   mvn versions:set -DnewVersion=0.2.0 -DgenerateBackupPoms=false
+   ./mvnw versions:set -DnewVersion=0.2.0 -DgenerateBackupPoms=false
    ```
    In `CHANGELOG.md`, rename `## [Unreleased]` to `## [0.2.0] - YYYY-MM-DD` and add a new empty
    Unreleased section.
@@ -50,10 +55,10 @@ by signing in to the Central Portal with the GitHub account; no domain is needed
    <https://central.sonatype.com/publishing/deployments>, review the VALIDATED deployment and press
    *Publish*. It appears on Maven Central after some tens of minutes. Then publish the draft GitHub
    release the workflow created.
-5. **Next cycle.** `mvn versions:set -DnewVersion=0.3.0-SNAPSHOT -DgenerateBackupPoms=false`.
+5. **Next cycle.** `./mvnw versions:set -DnewVersion=0.3.0-SNAPSHOT -DgenerateBackupPoms=false`.
 
 ## Local checks
 
 ```bash
-mvn -Prelease -Dgpg.skip -DskipTests package   # main, sources and javadoc jars without signing
+./mvnw -Prelease -Dgpg.skip -DskipTests package   # main, sources and javadoc jars without signing
 ```

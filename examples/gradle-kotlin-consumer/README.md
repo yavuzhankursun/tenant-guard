@@ -12,7 +12,7 @@ way a downstream project would: one `testImplementation` dependency, nothing els
 Run it (needs Docker and JDK 21):
 
 ```sh
-mvn -B -DskipTests install          # at the repository root: puts 0.2.0-SNAPSHOT into ~/.m2
+mvn -B -DskipTests install          # at the repository root: puts 0.2.0 into ~/.m2
 cd examples/gradle-kotlin-consumer
 ./gradlew test
 ```

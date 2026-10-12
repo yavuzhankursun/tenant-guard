@@ -8,6 +8,8 @@ version may change the public API.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
 ### Changed
 
 - `ObserverInstaller.install(...)` returns an `Installation`; callers that install directly must
@@ -82,5 +84,6 @@ First tagged version (git tag only, not published to Maven Central).
 - GET endpoint scanner over Spring's handler mappings and MockMvc (`EndpointScanner`).
 - Apache License 2.0, GitHub Actions CI, design notes.
 
-[Unreleased]: https://github.com/yavuzhankursun/tenant-guard/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yavuzhankursun/tenant-guard/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yavuzhankursun/tenant-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yavuzhankursun/tenant-guard/releases/tag/v0.1.0

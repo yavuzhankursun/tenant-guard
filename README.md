@@ -101,20 +101,19 @@ leaks.
 
 ## Quick start
 
-Add the test dependency (the coordinates are `io.github.yavuzhankursun:tenant-guard`; until the
-first Maven Central release, build it with `mvn install` from this repository):
+Add the test dependency from Maven Central:
 
 ```xml
 <dependency>
     <groupId>io.github.yavuzhankursun</groupId>
     <artifactId>tenant-guard</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0</version>
     <scope>test</scope>
 </dependency>
 ```
 
 ```kotlin
-testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0-SNAPSHOT") // Gradle Kotlin DSL
+testImplementation("io.github.yavuzhankursun:tenant-guard:0.2.0") // Gradle Kotlin DSL
 ```
 
 The library brings no transitive dependencies; Spring, JUnit and Jackson come from your project.
@@ -459,7 +458,6 @@ result with its own `InternalError`, guard or no guard.
 
 - Runs against open-source multi-tenant Spring projects.
 - Warn about views without `security_invoker` and `SECURITY DEFINER` functions at install time.
-- First release to Maven Central (see [docs/RELEASING.md](docs/RELEASING.md)).
 - Write scanning: replace ids inside request bodies with the victim's; spoof probes on PUT/PATCH.
 - An owner probe that tells a CSRF 403 from a real authorization rejection.
 
